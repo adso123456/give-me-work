@@ -1,0 +1,51 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true
+  },
+  "provider_id": {
+    "description": "LLM Provider ID",
+    "type": "string",
+    "hint": "留空时使用 AstrBot 当前默认 Provider",
+    "default": ""
+  },
+  "feishu_table_url": {
+    "description": "飞书多维表格 URL",
+    "type": "string",
+    "hint": "不要写入日志；服务器上的 Playwright 需要能够访问并登录该表格",
+    "default": ""
+  },
+  "browser_headless": {
+    "description": "Playwright 无头模式",
+    "type": "bool",
+    "default": true
+  },
+  "webhook_host": {
+    "description": "Webhook 监听地址",
+    "type": "string",
+    "default": "0.0.0.0"
+  },
+  "webhook_port": {
+    "description": "Webhook 监听端口",
+    "type": "int",
+    "default": 6190
+  },
+  "webhook_token": {
+    "description": "Webhook Bearer Token",
+    "type": "string",
+    "hint": "不要写入日志；为空时不启动 Webhook",
+    "default": ""
+  },
+  "card_mode": {
+    "description": "QQ 通知卡片模式",
+    "type": "string",
+    "options": ["auto", "napcat", "text"],
+    "default": "auto"
+  },
+  "debug": {
+    "description": "调试日志",
+    "type": "bool",
+    "default": false
+  }
+}
