@@ -23,6 +23,7 @@ from .events.server import EventServer
 from .feishu.tools import FeishuTools
 from .feishu.login_flow import run_feishu_login
 from .feishu.web_adapter import FeishuAdapterError, FeishuWebAdapter
+from .feishu.write_test import run_table_write_test
 from .models import CardAction, RecruitEvent
 from .state_store import StateStore
 
@@ -200,6 +201,14 @@ class JobAgentPlugin(Star):
             yield event.plain_result("\n".join(lines))
         except Exception as exc:
             yield event.plain_result(f"❌ 飞书表格测试失败：{self._short_error(exc)}")
+
+    @filter.command("job_table_write_test")
+    async def job_table_write_test(self, event: AstrMessageEvent):
+        try:
+            assert self.adapter is not None
+            yield event.plain_result(await run_table_write_test(self.adapter))
+        except Exception as exc:
+            yield event.plain_result(f"❌ 写入测试执行失败：{self._short_error(exc)}")
 
     @filter.command("job_test_hr")
     async def job_test_hr(self, event: AstrMessageEvent):
