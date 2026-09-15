@@ -219,6 +219,7 @@ def test_adapter_qr_login_saves_storage_state_after_scan(monkeypatch, tmp_path):
             self.login_checks = 0
             self.url = "https://accounts.feishu.cn/login"
             self.qr_path = None
+            self.waits = []
 
         def set_default_timeout(self, timeout):
             return None
@@ -244,7 +245,7 @@ def test_adapter_qr_login_saves_storage_state_after_scan(monkeypatch, tmp_path):
             Path(path).write_bytes(b"qr")
 
         async def wait_for_timeout(self, milliseconds):
-            return None
+            self.waits.append(milliseconds)
 
     class FakeContext:
         def __init__(self, page):
@@ -302,6 +303,7 @@ def test_adapter_qr_login_saves_storage_state_after_scan(monkeypatch, tmp_path):
     async def scenario():
         await adapter.start_qr_login(qr_path)
         assert qr_path.read_bytes() == b"qr"
+        assert page.waits
         assert await adapter.wait_for_qr_login(timeout_ms=100)
         await adapter.close()
 

@@ -183,6 +183,8 @@ class FeishuWebAdapter:
             await self.page.goto(self.table_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
             if not await self._is_login_page():
                 raise FeishuAdapterError("当前飞书已有有效登录状态，无需扫码")
+            # 飞书登录页先显示加载动画，二维码通常在异步请求完成后才渲染。
+            await self.page.wait_for_timeout(min(5_000, self.timeout_ms))
             target = Path(qr_path)
             target.parent.mkdir(parents=True, exist_ok=True)
             await self.page.screenshot(path=str(target), full_page=True)
