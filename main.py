@@ -11,7 +11,7 @@ from typing import Any
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.core.message.components import Plain
+from astrbot.core.message.components import Image, Plain
 from astrbot.core.message.message_event_result import MessageChain
 
 from .agent import AgentResult, JobAgentService
@@ -21,6 +21,7 @@ from .cards.text_renderer import TextCardRenderer
 from .events.mock import MockEventSource
 from .events.server import EventServer
 from .feishu.tools import FeishuTools
+from .feishu.login_flow import run_feishu_login
 from .feishu.web_adapter import FeishuAdapterError, FeishuWebAdapter
 from .models import CardAction, RecruitEvent
 from .state_store import StateStore
@@ -68,6 +69,15 @@ class _MissingFeishuAdapter:
         return await self._fail()
 
     async def check_access(self):
+        return await self._fail()
+
+    def has_storage_state(self):
+        return False
+
+    async def start_qr_login(self, qr_path):
+        return await self._fail()
+
+    async def wait_for_qr_login(self):
         return await self._fail()
 
     async def close(self):
@@ -164,6 +174,20 @@ class JobAgentPlugin(Star):
                 ]
             )
         )
+
+    @filter.command("job_feishu_login")
+    async def job_feishu_login(self, event: AstrMessageEvent):
+        assert self.adapter is not None
+        qr_path = self._data_dir / "debug" / "feishu_login_qr.png"
+
+        async def send_qr(path: Path):
+            await self._send_feishu_qr(event.unified_msg_origin, path)
+
+        try:
+            result = await run_feishu_login(self.adapter, send_qr, qr_path)
+            yield event.plain_result(f"✅ {result}")
+        except Exception as exc:
+            yield event.plain_result(f"❌ 飞书登录失败：{self._short_error(exc)}")
 
     @filter.command("job_table_test")
     async def job_table_test(self, event: AstrMessageEvent):
@@ -268,6 +292,15 @@ class JobAgentPlugin(Star):
 
     async def _send_text(self, umo: str, text: str) -> None:
         await self.context.send_message(umo, MessageChain(chain=[Plain(text)]))
+
+    async def _send_feishu_qr(self, umo: str, qr_path: Path) -> None:
+        chain = MessageChain(
+            chain=[
+                Plain("请使用飞书或豆包 App 扫描二维码登录，扫码完成后请等待回复。"),
+                Image.fromFileSystem(str(qr_path)),
+            ]
+        )
+        await self.context.send_message(umo, chain)
 
     def _build_card(self, event: RecruitEvent, result: AgentResult) -> JobNotificationCard:
         card_type = result.card_type if result.card_type in {"hr_reply", "resume_request", "interview", "system"} else "system"

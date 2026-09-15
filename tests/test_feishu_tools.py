@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 
 class FakeAdapter:
@@ -208,3 +209,181 @@ def test_adapter_parses_canvas_clipboard_rows():
             },
         }
     ]
+
+
+def test_adapter_qr_login_saves_storage_state_after_scan(monkeypatch, tmp_path):
+    from feishu import web_adapter
+
+    class FakePage:
+        def __init__(self):
+            self.login_checks = 0
+            self.url = "https://accounts.feishu.cn/login"
+            self.qr_path = None
+
+        def set_default_timeout(self, timeout):
+            return None
+
+        async def goto(self, *args, **kwargs):
+            return None
+
+        async def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+        def locator(self, selector):
+            return self
+
+        async def inner_text(self):
+            self.login_checks += 1
+            if self.login_checks == 1:
+                return "Log In With QR Code"
+            self.url = "https://my.feishu.cn/base/test"
+            return "简历投递表"
+
+        async def screenshot(self, path, **kwargs):
+            self.qr_path = path
+            Path(path).write_bytes(b"qr")
+
+        async def wait_for_timeout(self, milliseconds):
+            return None
+
+    class FakeContext:
+        def __init__(self, page):
+            self.page = page
+            self.saved_path = None
+
+        async def new_page(self):
+            return self.page
+
+        async def storage_state(self, path):
+            self.saved_path = path
+            Path(path).write_text("{}", encoding="utf-8")
+
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        def __init__(self, context):
+            self.context = context
+
+        async def new_context(self, **kwargs):
+            return self.context
+
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        def __init__(self, browser):
+            self.browser = browser
+            self.chromium = self
+
+        async def start(self):
+            return self
+
+        async def launch(self, **kwargs):
+            return self.browser
+
+        async def stop(self):
+            return None
+
+    page = FakePage()
+    context = FakeContext(page)
+    monkeypatch.setattr(
+        web_adapter,
+        "async_playwright",
+        lambda: FakePlaywright(FakeBrowser(context)),
+    )
+    state_path = tmp_path / "feishu_storage_state.json"
+    qr_path = tmp_path / "feishu_login_qr.png"
+    adapter = web_adapter.FeishuWebAdapter(
+        "https://my.feishu.cn/base/test",
+        storage_state_path=state_path,
+    )
+
+    async def scenario():
+        await adapter.start_qr_login(qr_path)
+        assert qr_path.read_bytes() == b"qr"
+        assert await adapter.wait_for_qr_login(timeout_ms=100)
+        await adapter.close()
+
+    asyncio.run(scenario())
+
+    assert state_path.exists()
+    assert context.saved_path == str(state_path)
+
+
+def test_adapter_qr_login_timeout_has_clear_error(monkeypatch, tmp_path):
+    from feishu import web_adapter
+
+    class FakePage:
+        url = "https://accounts.feishu.cn/login"
+
+        def set_default_timeout(self, timeout):
+            return None
+
+        async def goto(self, *args, **kwargs):
+            return None
+
+        async def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+        def locator(self, selector):
+            return self
+
+        async def inner_text(self):
+            return "Log In With QR Code"
+
+        async def screenshot(self, path, **kwargs):
+            Path(path).write_bytes(b"qr")
+
+        async def wait_for_timeout(self, milliseconds):
+            return None
+
+    class FakeContext:
+        async def new_page(self):
+            return FakePage()
+
+        async def storage_state(self, path):
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs):
+            return FakeContext()
+
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        chromium = None
+
+        async def start(self):
+            self.chromium = self
+            return self
+
+        async def launch(self, **kwargs):
+            return FakeBrowser()
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setattr(web_adapter, "async_playwright", lambda: FakePlaywright())
+    adapter = web_adapter.FeishuWebAdapter(
+        "https://my.feishu.cn/base/test",
+        storage_state_path=tmp_path / "state.json",
+    )
+
+    async def scenario():
+        await adapter.start_qr_login(tmp_path / "qr.png")
+        try:
+            await adapter.wait_for_qr_login(timeout_ms=5)
+        finally:
+            await adapter.close()
+
+    try:
+        asyncio.run(scenario())
+    except web_adapter.FeishuAdapterError as exc:
+        assert "扫码登录超时" in str(exc)
+    else:
+        raise AssertionError("expected QR login timeout")

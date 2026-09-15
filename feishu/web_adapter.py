@@ -162,11 +162,60 @@ class FeishuWebAdapter:
         await self.open()
         return bool(self.headers)
 
+    def has_storage_state(self) -> bool:
+        return bool(self.storage_state_path and self.storage_state_path.exists())
+
+    async def start_qr_login(self, qr_path: str | Path) -> Path:
+        """打开飞书登录页并保存二维码截图，保持浏览器会话等待扫码。"""
+        if not self.storage_state_path:
+            raise FeishuAdapterError("未配置飞书 storage_state_path")
+        if self.page is not None:
+            await self.close()
+        try:
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(headless=self.headless)
+            context_options: dict[str, Any] = {}
+            if self.storage_state_path.exists():
+                context_options["storage_state"] = str(self.storage_state_path)
+            self._context = await self._browser.new_context(**context_options)
+            self.page = await self._context.new_page()
+            self.page.set_default_timeout(self.timeout_ms)
+            await self.page.goto(self.table_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            if not await self._is_login_page():
+                raise FeishuAdapterError("当前飞书已有有效登录状态，无需扫码")
+            target = Path(qr_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            await self.page.screenshot(path=str(target), full_page=True)
+            return target
+        except Exception as exc:
+            if isinstance(exc, FeishuAdapterError):
+                raise
+            raise FeishuAdapterError(f"打开飞书登录页失败: {type(exc).__name__}") from exc
+
+    async def wait_for_qr_login(self, timeout_ms: int | None = None) -> bool:
+        """轮询当前登录页，成功后保存 storage_state。"""
+        if self.page is None or self._context is None:
+            raise FeishuAdapterError("飞书扫码会话未启动")
+        wait_timeout = timeout_ms if timeout_ms is not None else self.timeout_ms
+        deadline = asyncio.get_running_loop().time() + (wait_timeout / 1000)
+        while True:
+            if not await self._is_login_page():
+                self.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+                await self._context.storage_state(path=str(self.storage_state_path))
+                return True
+            if asyncio.get_running_loop().time() >= deadline:
+                raise FeishuAdapterError("等待飞书扫码登录超时，请重新执行 /job_feishu_login")
+            await self.page.wait_for_timeout(1000)
+
+    async def _is_login_page(self) -> bool:
+        assert self.page is not None
+        body = (await self.page.locator("body").inner_text()).strip()
+        return self.is_login_page_text(body) or "accounts.feishu.cn" in (self.page.url or "")
+
     async def _wait_until_ready(self) -> None:
         assert self.page is not None
         await self.page.wait_for_load_state("domcontentloaded")
-        body = (await self.page.locator("body").inner_text()).strip()
-        if self.is_login_page_text(body) or "accounts.feishu.cn" in (self.page.url or ""):
+        if await self._is_login_page():
             raise FeishuAdapterError("飞书页面需要登录，服务器无可用登录会话")
 
     @staticmethod
