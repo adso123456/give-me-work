@@ -63,6 +63,12 @@
     "options": ["auto", "napcat", "text"],
     "default": "auto"
   },
+  "delete_confirm_required": {
+    "description": "删除记录是否需要二次确认",
+    "type": "bool",
+    "hint": "开启时 /job_delete 只做预览并给出确认码，需要用 /job_delete_confirm 确认后才真正删除；关闭后 /job_delete 直接删除",
+    "default": true
+  },
   "debug": {
     "description": "调试日志",
     "type": "bool",

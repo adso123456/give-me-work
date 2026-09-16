@@ -1,6 +1,6 @@
 # astrbot_plugin_job_agent
 
-AstrBot 求职管理插件 **V0.3.0**：接收统一招聘事件，调用 LLM Agent 维护飞书多维表格，并向绑定的 QQ 会话发送通知卡片。
+AstrBot 求职管理插件 **V0.4.0**：接收统一招聘事件，调用 LLM Agent 维护飞书多维表格，并向绑定的 QQ 会话发送通知卡片。
 
 V0.2 把存储层从「Playwright 抓飞书网页」换成了**飞书开放平台多维表格 API**：
 飞书前端把表格网格渲染在 canvas 上，语义化 DOM 选择器（`[role="row"]`、`[data-record-id]`、`[data-field-name]` …）
@@ -10,6 +10,10 @@ V0.2 把存储层从「Playwright 抓飞书网页」换成了**飞书开放平�
 V0.3 增加**图片卡片 + 回复数字交互**：个人 QQ + NapCat 无法发送可点击按钮（按钮消息要绑定官方机器人的
 `bot_appid`，NapCat 源码里也能看到 `botAppid: e.bot_appid`），因此卡片由 Pillow 本地渲染成图片，
 动作以「1 / 2 / 3」编号印在卡片上，直接回复数字即可同步飞书。
+
+V0.4 增加**删除指令**：`/job_delete` 默认只预览并要求二次确认（`/job_delete_confirm <确认码>`，5 分钟有效），
+加 `--yes` 才直接删除。删除**只走指令，不暴露给 LLM Agent**——`delete_job` 不在 Agent 的可用工具里，
+提示词里也仍然写着"不删除投递记录"，模型无法自主删表。
 
 ## 安装
 
@@ -42,6 +46,7 @@ V0.3 增加**图片卡片 + 回复数字交互**：个人 QQ + NapCat 无法发�
 | `webhook_host` / `webhook_port` | 事件接收地址，默认 **127.0.0.1:6190**（只监听本机） |
 | `webhook_token` | Bearer Token；为空则完全不启动 Webhook |
 | `card_mode` | `auto`(默认,优先图片卡片,失败回退纯文本) / `image` / `napcat` / `text` |
+| `delete_confirm_required` | 删除是否需要二次确认,默认 `true`;关闭后 `/job_delete` 直接删除 |
 
 数据目录由 AstrBot 的 `StarTools.get_data_dir()` 提供，即 `data/plugin_data/astrbot_plugin_job_agent/`；
 旧版写在 `data/plugins/plugin_data/` 下的 `job_agent_state.json` 会自动迁移一次（那个位置在插件升级时会被 AstrBot 删除）。
@@ -88,6 +93,21 @@ HR：HR小李
 - `/job_action <token> <action>`：处理指定卡片动作（也可直接回复数字）。
 - `/job <自然语言>`：新增、修改或查询求职记录。
 
+### 删除记录
+
+```
+/job_delete_find 字节跳动          # 搜索，列出 record_id（最多 5 条）
+/job_delete recvvlJJBnsi1P         # 预览这条记录，给出确认码
+/job_delete_confirm k7Rf2qZp       # 确认删除（5 分钟内有效）
+/job_delete rec1 rec2 rec3         # 一次预览多条，确认码确认后批量删除
+/job_delete recvvlJJBnsi1P --yes   # 跳过确认，直接删除（不可撤销）
+```
+
+- 删除走飞书 `batch_delete` 接口，插件侧没有任何回滚手段，请谨慎；
+- 确认码一次性使用，用过或过期都会提示"已执行/已失效"；
+- `delete_confirm_required=false` 时 `/job_delete` 直接删除；
+- LLM Agent 没有删除工具：`/job` 的自然语言指令只会新增/修改/查询，不会删记录。
+
 ## 事件接入
 
 `POST http://<host>:6190/job-agent/events`，请求头 `Authorization: Bearer <webhook_token>`，请求体：
@@ -116,9 +136,4 @@ HR：HR小李
 
 - 不支持由 Agent 写入附件（如 `简历文件`）与关联/人员字段：这些字段会被忽略并在返回值里给出 `warnings`。
 - `投递记录ID`、`创建人`、`创建时间`、`修改人`、`更新时间` 是系统字段，写入时自动忽略。
-- 不登录或操作 BOSS，也不会删除飞书记录。
-
-## 背景文档
-
-- [`CHANGELOG.md`](CHANGELOG.md)：各版本改了什么。
-- [`docs/fix-report-2026-09-16.md`](docs/fix-report-2026-09-16.md)：为什么放弃 Playwright 网页自动化、以及 42 项验证的证据记录。
+- 不登录或操作 BOSS；删除只能通过 `/job_delete*` 指令，LLM Agent 不具备删除能力。

@@ -10,6 +10,7 @@ from typing import Any
 
 MAX_PROCESSED_EVENTS = 1000
 PENDING_CARD_TTL_SECONDS = 30 * 24 * 3600
+PENDING_DELETE_TTL_SECONDS = 300
 
 
 def _default_state() -> dict[str, Any]:
@@ -18,6 +19,7 @@ def _default_state() -> dict[str, Any]:
         "bound_umo": None,
         "processed_event_ids": [],
         "pending_cards": [],
+        "pending_deletes": [],
         "card_action_tokens": {},
     }
 
@@ -148,6 +150,60 @@ class StateStore:
                     for token, card_id in (self._state.get("card_action_tokens") or {}).items()
                     if token in alive
                 }
+                await self._persist_unlocked()
+            return removed
+
+    # ------------------------------------------------------------ 删除确认
+
+    async def add_pending_delete(self, item: dict[str, Any]) -> None:
+        """登记一次待确认的删除（token 由调用方生成）。"""
+        token = str(item.get("token") or "").strip()
+        if not token:
+            raise ValueError("pending delete token is required")
+        record_ids = [str(value) for value in (item.get("record_ids") or []) if str(value)]
+        if not record_ids:
+            raise ValueError("pending delete record_ids is required")
+        async with self._lock:
+            entry = dict(item)
+            entry["record_ids"] = record_ids
+            entry.setdefault("status", "pending")
+            entry.setdefault("created_at", time.time())
+            pending = [x for x in self._state["pending_deletes"] if x.get("token") != token]
+            pending.append(entry)
+            self._state["pending_deletes"] = pending
+            await self._persist_unlocked()
+
+    async def get_pending_delete(self, token: str) -> dict[str, Any] | None:
+        async with self._lock:
+            for item in self._state["pending_deletes"]:
+                if item.get("token") == token:
+                    return dict(item)
+        return None
+
+    async def complete_delete(self, token: str) -> None:
+        async with self._lock:
+            for item in self._state["pending_deletes"]:
+                if item.get("token") == token:
+                    item["status"] = "done"
+                    item.setdefault("completed_at", time.time())
+                    break
+            await self._persist_unlocked()
+
+    async def prune_deletes(self, ttl_seconds: int = PENDING_DELETE_TTL_SECONDS) -> int:
+        """清掉过期或已完成的删除确认，返回清理条数。"""
+        deadline = time.time() - ttl_seconds
+        async with self._lock:
+            kept: list[dict[str, Any]] = []
+            removed = 0
+            for item in self._state["pending_deletes"]:
+                created = float(item.get("created_at") or 0)
+                expired = bool(created) and created < deadline
+                if expired or str(item.get("status") or "pending") != "pending":
+                    removed += 1
+                    continue
+                kept.append(item)
+            if removed:
+                self._state["pending_deletes"] = kept
                 await self._persist_unlocked()
             return removed
 

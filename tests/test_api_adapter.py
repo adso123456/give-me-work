@@ -204,13 +204,16 @@ def test_search_records_filters_on_plain_fields():
     assert [record["record_id"] for record in records] == ["r1"]
 
 
-def test_get_record_returns_none_when_api_reports_missing():
-    adapter = StubAdapter(responses=[FeishuAdapterError("飞书 API 错误 1254303: RecordIdNotFound")])
+@pytest.mark.parametrize("code", ["1254303", "1254043"])
+def test_get_record_returns_none_when_api_reports_missing(code):
+    adapter = StubAdapter(responses=[FeishuAdapterError(f"飞书 API 错误 {code}: RecordIdNotFound")])
     assert run(adapter.get_record("rec_gone")) is None
 
-    adapter2 = StubAdapter(responses=[FeishuAdapterError("飞书 API 错误 91403: Forbidden")])
+
+def test_get_record_propagates_permission_errors():
+    adapter = StubAdapter(responses=[FeishuAdapterError("飞书 API 错误 91403: Forbidden")])
     with pytest.raises(FeishuAdapterError):
-        run(adapter2.get_record("rec_x"))
+        run(adapter.get_record("rec_x"))
 
 
 def test_field_names_come_from_fields_api():
@@ -218,6 +221,58 @@ def test_field_names_come_from_fields_api():
     names = run(adapter.field_names())
     assert names[0] == "投递记录ID"
     assert "简历文件" in names
+
+
+def test_delete_record_calls_delete_endpoint():
+    adapter = StubAdapter(responses=[{"data": {}}])
+    assert run(adapter.delete_record("rec5")) is True
+    method, path, _kwargs = adapter.calls[0]
+    assert method == "DELETE"
+    assert path == "/bitable/v1/apps/app_tok/tables/tbl_tok/records/rec5"
+
+
+@pytest.mark.parametrize("code", ["1254303", "1254043"])
+def test_delete_record_returns_false_when_record_missing(code):
+    adapter = StubAdapter(responses=[FeishuAdapterError(f"飞书 API 错误 {code}: RecordIdNotFound")])
+    assert run(adapter.delete_record("rec_gone")) is False
+
+
+def test_delete_record_rejects_empty_id():
+    adapter = StubAdapter()
+    with pytest.raises(FeishuAdapterError):
+        run(adapter.delete_record(""))
+
+
+def test_delete_records_batch_reports_deleted_ids():
+    adapter = StubAdapter(
+        responses=[
+            {
+                "data": {
+                    "records": [
+                        {"deleted": True, "record_id": "r1"},
+                        {"deleted": False, "record_id": "r2"},
+                    ]
+                }
+            }
+        ]
+    )
+    deleted = run(adapter.delete_records(["r1", "r2"]))
+    method, path, kwargs = adapter.calls[0]
+    assert method == "POST"
+    assert path == "/bitable/v1/apps/app_tok/tables/tbl_tok/records/batch_delete"
+    assert kwargs["json_body"] == {"records": ["r1", "r2"]}
+    assert deleted == ["r1"]
+
+
+def test_delete_records_falls_back_to_input_when_api_returns_no_detail():
+    adapter = StubAdapter(responses=[{"data": {}}])
+    assert run(adapter.delete_records(["r1", "r2"])) == ["r1", "r2"]
+
+
+def test_delete_records_requires_ids():
+    adapter = StubAdapter()
+    with pytest.raises(FeishuAdapterError):
+        run(adapter.delete_records([]))
 
 
 def test_datetime_fields_are_rendered_as_readable_text():

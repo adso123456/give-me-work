@@ -132,3 +132,58 @@ def test_latest_pending_card_prefers_newest_for_umo(tmp_path):
         assert await store.latest_pending_card("umo_missing") is None
 
     asyncio.run(scenario())
+
+
+def test_pending_delete_lifecycle(tmp_path):
+    from state_store import StateStore
+
+    async def scenario():
+        store = StateStore(tmp_path / "state.json")
+        await store.load()
+        await store.add_pending_delete(
+            {"token": "d1", "record_ids": ["rec1", "rec2"], "umo": "umo_a"}
+        )
+        item = await store.get_pending_delete("d1")
+        assert item["record_ids"] == ["rec1", "rec2"]
+        assert item["status"] == "pending"
+        assert item["umo"] == "umo_a"
+
+        await store.complete_delete("d1")
+        assert (await store.get_pending_delete("d1"))["status"] == "done"
+        assert await store.get_pending_delete("missing") is None
+
+    asyncio.run(scenario())
+
+
+def test_pending_delete_requires_token_and_record_ids(tmp_path):
+    from state_store import StateStore
+
+    async def scenario():
+        store = StateStore(tmp_path / "state.json")
+        await store.load()
+        with pytest.raises(ValueError):
+            await store.add_pending_delete({"record_ids": ["rec1"]})
+        with pytest.raises(ValueError):
+            await store.add_pending_delete({"token": "d1", "record_ids": []})
+
+    asyncio.run(scenario())
+
+
+def test_prune_deletes_drops_expired_and_finished(tmp_path):
+    from state_store import StateStore
+
+    async def scenario():
+        store = StateStore(tmp_path / "state.json")
+        await store.load()
+        await store.add_pending_delete(
+            {"token": "old", "record_ids": ["rec_old"], "created_at": 1000.0}
+        )
+        await store.add_pending_delete({"token": "new", "record_ids": ["rec_new"]})
+        await store.complete_delete("new")
+
+        removed = await store.prune_deletes(ttl_seconds=10)
+        assert removed == 2
+        assert await store.get_pending_delete("old") is None
+        assert await store.get_pending_delete("new") is None
+
+    asyncio.run(scenario())

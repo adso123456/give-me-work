@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0 (2026-09-16)
+
+**新增删除能力(仅指令,不交给 LLM)**
+
+- `feishu/api_adapter.py` 新增 `delete_record()`(单条,DELETE 接口)与
+  `delete_records()`(批量,`records/batch_delete`),记录不存在(1254303)时返回 `False` 而不是抛错。
+- 新指令:
+  - `/job_delete_find <关键词>`:搜索并列出 `record_id`(最多 5 条),直接给出可复制的删除命令;
+  - `/job_delete <记录ID> [更多ID…]`:默认**只预览**并生成确认码;
+  - `/job_delete_confirm <确认码>`:确认后才真正删除(确认码 5 分钟有效、一次性);
+  - `/job_delete <记录ID> --yes`:跳过确认直接删除。
+- 新增配置 `delete_confirm_required`(默认 `true`),关闭后 `/job_delete` 直接删除。
+- 待确认删除单独存放在 `pending_deletes`,与卡片动作互不干扰,并在每次发起删除时清理过期项。
+- **LLM Agent 依然拿不到删除工具**:`FeishuTools` 与 `JobAgentService.ALLOWED_TOOLS` 保持原有的
+  search/get/create/update 四项,提示词里的"不删除投递记录"继续有效,模型无法自主删表。
+- 新增 `commands.py` 统一解析指令参数(兼容 `/`、`!`、无唤醒前缀三种写法),
+  并保证 `/job_delete_confirm` 不会被误判成 `/job_delete`。
+- 测试 42 → 58:`test_commands.py`、适配器删除用例、状态存储待删除用例、入口冒烟扩展。
+
 ## 0.3.0 (2026-09-16)
 
 **卡片交互(适配个人 QQ 的能力边界)**

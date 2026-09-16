@@ -62,6 +62,11 @@ def test_provider_llm_client_wraps_text_chat():
     assert provider.calls == [("hello", None, "system")]
 
 
+def test_delete_commands_are_registered():
+    for name in ("job_delete", "job_delete_confirm", "job_delete_find"):
+        assert hasattr(plugin_main.JobAgentPlugin, name), f"缺少指令处理器: {name}"
+
+
 def test_missing_feishu_adapter_never_pretends_success():
     import asyncio
 
@@ -76,6 +81,8 @@ def test_missing_feishu_adapter_never_pretends_success():
             adapter.list_records(limit=1),
             adapter.check_access(),
             adapter.field_names(),
+            adapter.delete_record("rec1"),
+            adapter.delete_records(["rec1"]),
         ):
             with pytest.raises(FeishuAdapterError):
                 await coro

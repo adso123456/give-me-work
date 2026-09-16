@@ -67,9 +67,18 @@ ERROR_HINTS = {
     99991663: "tenant_access_token 无效或过期（将自动重试一次）",
     99991661: "tenant_access_token 缺失",
     1254005: "app_token/table_id 或字段名不存在",
+    1254043: "记录不存在或已被删除",
     1254303: "记录不存在或已被删除",
     1254302: "字段值类型不符合字段类型",
 }
+
+# 飞书对"记录不存在"返回过多种错误码，这里统一处理
+NOT_FOUND_CODES = ("1254043", "1254303")
+
+
+def is_not_found_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return any(code in text for code in NOT_FOUND_CODES)
 
 
 class FeishuAdapterError(RuntimeError):
@@ -385,7 +394,7 @@ class FeishuApiAdapter:
         try:
             payload = await self._request("GET", f"{self.table_path}/records/{record_id}")
         except FeishuAdapterError as exc:
-            if "1254303" in str(exc):
+            if is_not_found_error(exc):
                 return None
             raise
         record = (payload.get("data") or {}).get("record")
@@ -456,6 +465,43 @@ class FeishuApiAdapter:
     async def check_access(self) -> bool:
         fields = await self.list_fields(refresh=True)
         return bool(fields)
+
+    async def delete_record(self, record_id: str) -> bool:
+        """删除单条记录；记录不存在时返回 False。"""
+        if not record_id:
+            raise FeishuAdapterError("record_id 不能为空")
+        try:
+            await self._request(
+                "DELETE", f"{self.table_path}/records/{record_id}"
+            )
+        except FeishuAdapterError as exc:
+            if is_not_found_error(exc):
+                return False
+            raise
+        logger.info("[feishu] deleted record %s", record_id)
+        return True
+
+    async def delete_records(self, record_ids: list[str]) -> list[str]:
+        """批量删除记录，返回实际被删除的 record_id 列表。"""
+        ids = [str(item).strip() for item in (record_ids or []) if str(item).strip()]
+        if not ids:
+            raise FeishuAdapterError("record_ids 不能为空")
+        payload = await self._request(
+            "POST",
+            f"{self.table_path}/records/batch_delete",
+            json_body={"records": ids},
+        )
+        records = (payload.get("data") or {}).get("records")
+        if not isinstance(records, list) or not records:
+            logger.info("[feishu] batch deleted %d record(s)", len(ids))
+            return ids
+        deleted = [
+            str(item.get("record_id"))
+            for item in records
+            if isinstance(item, dict) and item.get("deleted", True)
+        ]
+        logger.info("[feishu] batch deleted %d/%d record(s)", len(deleted), len(ids))
+        return deleted
 
     # 兼容旧接口（浏览器方案遗留），API 模式无需扫码
     def has_storage_state(self) -> bool:

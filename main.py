@@ -24,6 +24,7 @@ from .cards.image_renderer import CardImageRenderer
 from .cards.models import JobNotificationCard
 from .cards.napcat_renderer import NapCatCardRenderer
 from .cards.text_renderer import ACTION_LABELS, TextCardRenderer
+from .commands import parse_confirm_args, parse_delete_args, parse_find_args
 from .events.mock import MockEventSource
 from .events.server import EventServer
 from .feishu.api_adapter import FeishuAdapterError, FeishuApiAdapter, parse_table_url
@@ -39,7 +40,7 @@ except Exception:  # pragma: no cover - 兼容旧版本
 
 
 PLUGIN_NAME = "astrbot_plugin_job_agent"
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.4.0"
 
 
 class _ProviderLlmClient:
@@ -88,6 +89,12 @@ class _MissingFeishuAdapter:
         return await self._fail()
 
     async def field_names(self):
+        return await self._fail()
+
+    async def delete_record(self, record_id):
+        return await self._fail()
+
+    async def delete_records(self, record_ids):
         return await self._fail()
 
     async def close(self):
@@ -279,6 +286,38 @@ class JobAgentPlugin(Star):
         result = await self.agent.handle_command(command)
         yield event.plain_result(self._result_text(result))
 
+    # ------------------------------------------------------------ 删除指令
+
+    @filter.command("job_delete")
+    async def job_delete(self, event: AstrMessageEvent):
+        parsed = parse_delete_args(event.message_str)
+        record_ids, force = parsed if parsed is not None else ([], False)
+        if not record_ids:
+            yield event.plain_result(
+                "用法：/job_delete <记录ID> [更多记录ID…] [--yes]\n"
+                "· 默认先预览、再让你确认，不会立刻删\n"
+                "· 加 --yes 直接删除（不可撤销）\n"
+                "· 不知道记录ID：先 /job_delete_find <关键词>"
+            )
+            return
+        yield event.plain_result(
+            await self._request_delete(record_ids, force, event.unified_msg_origin)
+        )
+
+    @filter.command("job_delete_confirm")
+    async def job_delete_confirm(self, event: AstrMessageEvent):
+        args = parse_confirm_args(event.message_str) or []
+        if not args:
+            yield event.plain_result("用法：/job_delete_confirm <确认码>")
+            return
+        yield event.plain_result(await self._confirm_delete(args[0]))
+
+    @filter.command("job_delete_find")
+    async def job_delete_find(self, event: AstrMessageEvent):
+        args = parse_find_args(event.message_str) or []
+        keyword = " ".join(args).strip()
+        yield event.plain_result(await self._find_for_delete(keyword))
+
     # ------------------------------------------------------------ 事件处理
 
     async def _handle_webhook_event(self, event: RecruitEvent):
@@ -424,6 +463,92 @@ class JobAgentPlugin(Star):
             await self._send_text(umo, text)
         except Exception as exc:  # 通知失败不应再抛异常打断主流程
             logger.warning("[card] fallback notify failed error=%s", self._short_error(exc))
+
+    def _delete_adapter(self):
+        adapter = self.adapter
+        if adapter is None or not hasattr(adapter, "delete_records"):
+            raise FeishuAdapterError("当前飞书适配器不支持删除")
+        return adapter
+
+    async def _request_delete(self, record_ids: list[str], force: bool, umo: str) -> str:
+        """删除入口：默认先预览并要求二次确认，--yes 才直接删。"""
+        assert self.state is not None
+        adapter = self._delete_adapter()
+        try:
+            records = []
+            missing = []
+            for record_id in record_ids:
+                record = await adapter.get_record(record_id)
+                if record is None:
+                    missing.append(record_id)
+                else:
+                    records.append(record)
+        except Exception as exc:
+            return f"❌ 查询待删记录失败：{self._short_error(exc)}"
+
+        lines: list[str] = []
+        if missing:
+            lines.append("❌ 未找到记录：" + "、".join(str(item) for item in missing))
+        if not records:
+            return "\n".join(lines) or "❌ 没有可删除的记录"
+
+        lines.append(f"⚠️ 即将删除 {len(records)} 条记录：")
+        for record in records:
+            lines.append(f"· {record.get('record_id')}：{self._record_summary(record)}")
+        ids = [str(record.get("record_id")) for record in records]
+
+        if force or not bool(self._cfg("delete_confirm_required", True)):
+            try:
+                deleted = await adapter.delete_records(ids)
+            except Exception as exc:
+                return "\n".join(lines + [f"❌ 删除失败：{self._short_error(exc)}"])
+            lines.append(f"🗑️ 已删除 {len(deleted)} 条记录（不可撤销）")
+            return "\n".join(lines)
+
+        await self.state.prune_deletes()
+        token = secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:8]
+        await self.state.add_pending_delete(
+            {"token": token, "record_ids": ids, "umo": umo}
+        )
+        lines.append("")
+        lines.append(f"确认删除请发送：/job_delete_confirm {token}")
+        lines.append("（5 分钟内有效；不确认就什么都不会删）")
+        return "\n".join(lines)
+
+    async def _confirm_delete(self, token: str) -> str:
+        assert self.state is not None
+        await self.state.prune_deletes()
+        pending = await self.state.get_pending_delete(token)
+        if pending is None:
+            return "❌ 确认码无效或已过期（有效期 5 分钟），请重新发起 /job_delete"
+        if str(pending.get("status") or "pending") != "pending":
+            return "ℹ️ 这次删除已经执行过了，未重复删除"
+        adapter = self._delete_adapter()
+        record_ids = [str(item) for item in (pending.get("record_ids") or [])]
+        try:
+            deleted = await adapter.delete_records(record_ids)
+        except Exception as exc:
+            return f"❌ 删除失败：{self._short_error(exc)}"
+        await self.state.complete_delete(token)
+        return "🗑️ 已删除 %d 条记录（不可撤销）：%s" % (
+            len(deleted),
+            "、".join(deleted) or "（无）",
+        )
+
+    async def _find_for_delete(self, keyword: str) -> str:
+        adapter = self._delete_adapter()
+        try:
+            records = await adapter.search_records(keyword)
+        except Exception as exc:
+            return f"❌ 查询失败：{self._short_error(exc)}"
+        if not records:
+            return f"没有匹配「{keyword}」的记录" if keyword else "表格里没有记录"
+        lines = [f"🔍 匹配 {len(records)} 条（最多显示 5 条）："]
+        for record in records[:5]:
+            lines.append(f"· {record.get('record_id')}：{self._record_summary(record)}")
+        ids = " ".join(str(record.get("record_id")) for record in records[:5])
+        lines.extend(["", "删除其中一条：/job_delete <记录ID>", f"删除这 5 条：/job_delete {ids}"])
+        return "\n".join(lines)
 
     async def _send_text(self, umo: str, text: str) -> None:
         await self.context.send_message(umo, MessageChain(chain=[Plain(text)]))
