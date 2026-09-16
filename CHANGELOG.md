@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.0 (2026-09-16)
+
+**新增 BOSS 直聘聊天流水接入(只推通知、不落表)**
+
+BOSS 没有面向求职者的开放接口,因此按"浏览器内旁听"的方案接入:一个油猴脚本挂在
+`https://www.zhipin.com/web/geek/chat`,劫持页面自己的 XHR/fetch/WebSocket,
+把聊天消息 POST 到本插件的 webhook。登录态、`__zp_stoken__`、滑块全部留在浏览器里,
+不额外产生请求,也不需要服务器常开浏览器。
+
+- 新增事件类型 `chat_message`:**只推 QQ 通知,不走 LLM、不写飞书表格**(聊天流水量大且琐碎);
+- 同一会话在 `chat_notify_window_seconds`(默认 60 秒)内的多条消息**合并成一条**推送,避免刷屏;
+- 新增 `/job_chat_test`:模拟一条聊天流水,验证通知链路;
+- webhook 侧验收:错误 token → 401、非法体 → 400、正常 → 202、重复投递 → 200 duplicate;
+- 脚本与说明见 `userscript/boss-chat-bridge.user.js`。
+
+顺带修掉一个隐患:**图片卡片依赖的中文字体原先装在容器层里**,容器一重建就消失,
+卡片会静默退回纯文本(这次为了暴露 webhook 端口重建过容器,正好踩到)。
+现在字体放在 bind mount 的 `data/plugin_data/astrbot_plugin_job_agent/fonts/`,
+也可以用 `card_font_path` 显式指定;渲染器补了「显式字体路径」「字体缺失时报错」两个测试。
+
+测试 73 → 76(图片渲染的 4 个用例不再因为系统没字体而 skip)。
+
 ## 0.4.1 (2026-09-16)
 
 **代码评审提出的 5 个问题**

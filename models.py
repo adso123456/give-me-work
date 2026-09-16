@@ -12,6 +12,8 @@ EVENT_TYPES = {
     "resume_request",
     "interview_invitation",
     "system_notice",
+    # 聊天流水：只推通知、不落表（由 main 里的 notify-only 分支处理）
+    "chat_message",
 }
 
 CARD_ACTIONS = {

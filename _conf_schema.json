@@ -70,6 +70,18 @@
     "hint": "开启时 /job_delete 只做预览并给出确认码，需要用 /job_delete_confirm 确认后才真正删除；关闭后 /job_delete 直接删除",
     "default": true
   },
+  "chat_notify_window_seconds": {
+    "description": "聊天消息合并推送窗口(秒)",
+    "type": "int",
+    "hint": "BOSS 聊天流水默认只推 QQ 通知、不写飞书表格；同一会话在这个窗口内的多条消息会合并成一条推送。填 0 表示每条都立刻推",
+    "default": 60
+  },
+  "card_font_path": {
+    "description": "图片卡片中文字体路径(可选)",
+    "type": "string",
+    "hint": "留空时先找 data/plugin_data/astrbot_plugin_job_agent/fonts/ 下的 ttc/ttf/otf，再找系统字体；找不到会自动回退纯文本卡片",
+    "default": ""
+  },
   "debug": {
     "description": "调试日志",
     "type": "bool",

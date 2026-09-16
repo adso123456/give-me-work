@@ -43,6 +43,24 @@ class MockEventSource:
         )
 
     @staticmethod
+    def chat_message(event_id: str = "evt_mock_chat") -> RecruitEvent:
+        """模拟一条 BOSS 聊天流水（只推通知、不落表）。"""
+        return RecruitEvent.from_dict(
+            {
+                "schema_version": "1.0",
+                "event_id": event_id,
+                "platform": "boss",
+                "event_type": "chat_message",
+                "conversation_id": "boss_mock_chat_01",
+                "company": "__JOB_AGENT_V1_TEST__",
+                "position": "测试AI岗位",
+                "contact": "测试HR",
+                "content": "在吗？方便发一份简历看看吗？",
+                "occurred_at": "2026-09-15T12:00:00+08:00",
+            }
+        )
+
+    @staticmethod
     def resume_request(event_id: str = "evt_mock_resume") -> RecruitEvent:
         return RecruitEvent.from_dict(
             {

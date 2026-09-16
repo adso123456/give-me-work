@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import time
 from pathlib import Path
@@ -40,7 +41,7 @@ except Exception:  # pragma: no cover - 兼容旧版本
 
 
 PLUGIN_NAME = "astrbot_plugin_job_agent"
-PLUGIN_VERSION = "0.4.1"
+PLUGIN_VERSION = "0.5.0"
 
 
 class _ProviderLlmClient:
@@ -120,6 +121,11 @@ class JobAgentPlugin(Star):
         self._provider = None
         self._data_dir = self._resolve_data_dir()
         self._adapter_reason = ""
+        # 聊天流水合并推送缓冲（只推通知，不落表）
+        self._chat_buffer: dict[str, list[str]] = {}
+        self._chat_headers: dict[str, str] = {}
+        self._chat_targets: dict[str, str] = {}
+        self._chat_tasks: dict[str, asyncio.Task[Any]] = {}
 
     # ------------------------------------------------------------ 生命周期
 
@@ -164,6 +170,7 @@ class JobAgentPlugin(Star):
         )
 
     async def terminate(self):
+        await self._flush_all_chat()
         if self.event_server:
             await self.event_server.stop()
         if self.adapter:
@@ -250,6 +257,13 @@ class JobAgentPlugin(Star):
         result = await self._handle_event(mock, event.unified_msg_origin)
         yield event.plain_result(self._result_text(result))
 
+    @filter.command("job_chat_test")
+    async def job_chat_test(self, event: AstrMessageEvent):
+        """模拟一条 BOSS 聊天流水：应该只推通知、不写飞书表格。"""
+        mock = MockEventSource.chat_message(event_id=f"evt_test_chat_{time.time_ns()}")
+        result = await self._handle_event(mock, event.unified_msg_origin)
+        yield event.plain_result(f"{self._result_text(result)}\n（聊天流水只推通知，不落表）")
+
     @filter.command("job_action")
     async def job_action(self, event: AstrMessageEvent):
         parts = event.message_str.strip().lstrip("/").split()
@@ -331,6 +345,9 @@ class JobAgentPlugin(Star):
 
     async def _handle_event(self, event: RecruitEvent, target_umo: str | None) -> AgentResult:
         logger.info("[event] received %s type=%s", event.event_id, event.event_type)
+        if event.event_type == "chat_message":
+            # 聊天流水不走 LLM、不落表，只做合并推送
+            return await self._handle_chat_event(event, target_umo)
         missing = await self._missing_agent()
         if missing is not None:
             return missing
@@ -421,7 +438,7 @@ class JobAgentPlugin(Star):
         await self.context.send_message(umo, chain)
 
     def _render_card_image(self, card: JobNotificationCard, token: str) -> Path:
-        renderer = CardImageRenderer()
+        renderer = CardImageRenderer(font_path=self._resolve_card_font())
         if not renderer.available():
             raise RuntimeError("缺少 Pillow 或中文字体")
         cards_dir = self._data_dir / "cards"
@@ -429,6 +446,21 @@ class JobAgentPlugin(Star):
         path = renderer.render(card, token, cards_dir / f"{card.card_id}.png", minimal=True)
         self._prune_card_images(cards_dir)
         return path
+
+    def _resolve_card_font(self) -> Path | None:
+        """中文字体优先取插件配置，其次取 data 目录下的 fonts/（bind mount，容器重建也不丢）。
+
+        容器重建会丢掉用 apt 装进容器层里的字体 —— 之前图片卡片就是这么突然变回纯文本的。
+        """
+        configured = str(self._cfg("card_font_path", "") or "").strip()
+        if configured and Path(configured).exists():
+            return Path(configured)
+        fonts_dir = self._data_dir / "fonts"
+        for pattern in ("*.ttc", "*.ttf", "*.otf"):
+            hits = sorted(fonts_dir.glob(pattern))
+            if hits:
+                return hits[0]
+        return None
 
     @staticmethod
     def _prune_card_images(cards_dir: Path, keep: int = 50) -> None:
@@ -552,6 +584,73 @@ class JobAgentPlugin(Star):
         ids = " ".join(str(record.get("record_id")) for record in records[:5])
         lines.extend(["", "删除其中一条：/job_delete <记录ID>", f"删除这 5 条：/job_delete {ids}"])
         return "\n".join(lines)
+
+    # ------------------------------------------------------------ 聊天流水通知
+
+    @staticmethod
+    def _chat_key(event: RecruitEvent) -> str:
+        return str(event.conversation_id or event.contact or event.company or "unknown")
+
+    @staticmethod
+    def _chat_header(event: RecruitEvent) -> str:
+        return " · ".join(part for part in (event.company, event.position) if part)
+
+    @staticmethod
+    def _chat_line(event: RecruitEvent) -> str:
+        return f"{event.contact or '对方'}：{event.content}"
+
+    async def _handle_chat_event(self, event: RecruitEvent, target_umo: str | None) -> AgentResult:
+        """聊天流水：只推 QQ 通知，不走 LLM、不写飞书表格。"""
+        if not target_umo:
+            return AgentResult(
+                summary="已收到聊天消息，但尚未绑定通知会话（先发 /job_bind）",
+                error="no_bound_umo",
+            )
+        key = self._chat_key(event)
+        self._chat_headers[key] = self._chat_header(event) or self._chat_headers.get(key, "")
+        self._chat_targets[key] = target_umo
+        self._chat_buffer.setdefault(key, []).append(self._chat_line(event))
+
+        window = max(0, int(self._cfg("chat_notify_window_seconds", 60) or 0))
+        if not window:
+            await self._flush_chat(key)
+            return AgentResult(summary="聊天消息已推送（未合并）")
+        task = self._chat_tasks.get(key)
+        if task is None or task.done():
+            self._chat_tasks[key] = asyncio.create_task(self._flush_chat_later(key, window))
+            return AgentResult(summary=f"聊天消息已入队，{window} 秒内同一会话合并推送")
+        return AgentResult(summary="聊天消息已并入当前批次")
+
+    async def _flush_chat_later(self, key: str, window: int) -> None:
+        try:
+            await asyncio.sleep(window)
+        except asyncio.CancelledError:
+            raise
+        await self._flush_chat(key)
+
+    async def _flush_chat(self, key: str) -> None:
+        lines = self._chat_buffer.pop(key, [])
+        header = self._chat_headers.pop(key, "")
+        target = self._chat_targets.pop(key, "")
+        self._chat_tasks.pop(key, None)
+        if not lines:
+            return
+        if not target and self.state is not None:
+            target = self.state.bound_umo or ""
+        if not target:
+            logger.warning("[chat] 丢弃 %d 条聊天消息：没有可用的通知会话", len(lines))
+            return
+        title = "💬 BOSS 新消息" + (f" · {header}" if header else "")
+        text = "\n".join([title, *lines])
+        if len(lines) > 1:
+            text += f"\n（{len(lines)} 条消息合并推送）"
+        await self._safe_send(target, text)
+
+    async def _flush_all_chat(self) -> None:
+        for task in list(self._chat_tasks.values()):
+            task.cancel()
+        for key in list(self._chat_buffer):
+            await self._flush_chat(key)
 
     async def _send_text(self, umo: str, text: str) -> None:
         await self.context.send_message(umo, MessageChain(chain=[Plain(text)]))

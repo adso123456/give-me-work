@@ -67,6 +67,65 @@ def test_delete_commands_are_registered():
         assert hasattr(plugin_main.JobAgentPlugin, name), f"缺少指令处理器: {name}"
 
 
+def test_chat_notify_helpers_format_messages():
+    ChatEvent = plugin_main.RecruitEvent
+    event = ChatEvent.from_dict(
+        {
+            "event_id": "evt_chat_1",
+            "platform": "boss",
+            "event_type": "chat_message",
+            "conversation_id": "boss_c1",
+            "company": "字节跳动",
+            "position": "AI应用开发工程师",
+            "contact": "HR小李",
+            "content": "方便发一份简历吗？",
+            "occurred_at": "2026-09-16T10:00:00+08:00",
+        }
+    )
+    assert plugin_main.JobAgentPlugin._chat_key(event) == "boss_c1"
+    assert plugin_main.JobAgentPlugin._chat_header(event) == "字节跳动 · AI应用开发工程师"
+    assert plugin_main.JobAgentPlugin._chat_line(event) == "HR小李：方便发一份简历吗？"
+
+
+def test_chat_message_event_type_is_supported_by_webhook_model():
+    event = plugin_main.RecruitEvent.from_dict(
+        {
+            "event_id": "evt_chat_2",
+            "platform": "boss",
+            "event_type": "chat_message",
+            "content": "在吗",
+            "occurred_at": "2026-09-16T10:00:00+08:00",
+        }
+    )
+    assert event.event_type == "chat_message"
+    assert plugin_main.JobAgentPlugin._chat_line(event) == "对方：在吗"
+
+
+def test_chat_flush_merges_buffered_lines():
+    import asyncio
+
+    sent: list[tuple[str, str]] = []
+
+    class Dummy:
+        _chat_buffer = {"boss_c1": ["HR小李：在吗", "HR小李：方便发简历吗"]}
+        _chat_headers = {"boss_c1": "字节跳动"}
+        _chat_targets = {"boss_c1": "umo_x"}
+        _chat_tasks = {}
+        state = None
+
+        async def _safe_send(self, umo, text):
+            sent.append((umo, text))
+
+    asyncio.run(plugin_main.JobAgentPlugin._flush_chat(Dummy(), "boss_c1"))
+    assert sent == [
+        (
+            "umo_x",
+            "💬 BOSS 新消息 · 字节跳动\nHR小李：在吗\nHR小李：方便发简历吗\n（2 条消息合并推送）",
+        )
+    ]
+    assert Dummy._chat_buffer == {}
+
+
 def test_missing_feishu_adapter_never_pretends_success():
     import asyncio
 
