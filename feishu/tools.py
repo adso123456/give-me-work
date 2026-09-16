@@ -11,6 +11,14 @@ class FeishuTools:
     def __init__(self, adapter: Any):
         self.adapter = adapter
 
+    async def field_names(self) -> list[str]:
+        """表格里真实存在的字段名，供 Agent 提示词使用，避免编造字段。"""
+        getter = getattr(self.adapter, "field_names", None)
+        if getter is None:
+            return []
+        names = await getter()
+        return [str(name) for name in names]
+
     async def search_jobs(self, query: str) -> dict[str, Any]:
         return {"records": await self.adapter.search_records(query)}
 

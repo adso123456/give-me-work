@@ -47,6 +47,8 @@ def test_webhook_auth_dedup_and_async_acceptance(tmp_path):
             assert accepted.status == 202
             assert (await accepted.json())["status"] == "accepted"
 
+            # 处理完成后重复投递 → duplicate
+            await asyncio.sleep(0.05)
             duplicate = await client.post(
                 "/job-agent/events",
                 json=_event_payload(),
@@ -54,9 +56,77 @@ def test_webhook_auth_dedup_and_async_acceptance(tmp_path):
             )
             assert duplicate.status == 200
             assert (await duplicate.json())["status"] == "duplicate"
-            await asyncio.sleep(0.01)
 
         assert received == ["evt_http_1"]
+
+    asyncio.run(scenario())
+
+
+def test_webhook_keeps_event_retryable_when_handler_fails(tmp_path):
+    """处理失败的事件不能被标记为已处理，发送方可安全重试。"""
+    from events.server import EventServer
+    from state_store import StateStore
+
+    async def scenario():
+        async def failing_handler(event):
+            raise RuntimeError("boom")
+
+        state = StateStore(tmp_path / "state.json")
+        await state.load()
+        service = EventServer("secret", state, failing_handler)
+        async with TestClient(TestServer(service.app)) as client:
+            first = await client.post(
+                "/job-agent/events",
+                json=_event_payload("evt_fail_1"),
+                headers={"Authorization": "Bearer secret"},
+            )
+            assert first.status == 202
+            await asyncio.sleep(0.05)
+
+            assert not await state.is_event_processed("evt_fail_1")
+            retry = await client.post(
+                "/job-agent/events",
+                json=_event_payload("evt_fail_1"),
+                headers={"Authorization": "Bearer secret"},
+            )
+            assert retry.status == 202
+            assert (await retry.json())["status"] == "accepted"
+
+    asyncio.run(scenario())
+
+
+def test_webhook_reports_inflight_event_as_not_yet_processed(tmp_path):
+    from events.server import EventServer
+    from state_store import StateStore
+
+    async def scenario():
+        release = asyncio.Event()
+
+        async def slow_handler(event):
+            await release.wait()
+
+        state = StateStore(tmp_path / "state.json")
+        await state.load()
+        service = EventServer("secret", state, slow_handler)
+        async with TestClient(TestServer(service.app)) as client:
+            first = await client.post(
+                "/job-agent/events",
+                json=_event_payload("evt_slow_1"),
+                headers={"Authorization": "Bearer secret"},
+            )
+            assert first.status == 202
+
+            second = await client.post(
+                "/job-agent/events",
+                json=_event_payload("evt_slow_1"),
+                headers={"Authorization": "Bearer secret"},
+            )
+            assert second.status == 202
+            assert (await second.json())["status"] == "in_progress"
+
+            release.set()
+            await asyncio.sleep(0.05)
+            assert await state.is_event_processed("evt_slow_1")
 
     asyncio.run(scenario())
 

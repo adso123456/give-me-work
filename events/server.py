@@ -1,8 +1,13 @@
-"""带 Bearer Token 的招聘事件 HTTP 服务。"""
+"""带 Bearer Token 的招聘事件 HTTP 服务。
+
+幂等语义：只有 `on_event` 成功返回后才标记事件已处理；
+处理失败的事件保持"未处理"，发送方可安全重试。
+"""
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -26,7 +31,7 @@ class EventServer:
         token: str,
         state_store: StateStore,
         on_event: Callable[[RecruitEvent], Awaitable[Any]],
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 6190,
     ):
         self.token = token
@@ -39,6 +44,7 @@ class EventServer:
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._inflight: set[str] = set()
 
     async def start(self) -> None:
         self._runner = web.AppRunner(self.app)
@@ -52,6 +58,7 @@ class EventServer:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        self._inflight.clear()
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -67,8 +74,10 @@ class EventServer:
 
         if await self.state_store.is_event_processed(event.event_id):
             return web.json_response({"status": "duplicate", "event_id": event.event_id})
+        if event.event_id in self._inflight:
+            return web.json_response({"status": "in_progress", "event_id": event.event_id}, status=202)
 
-        await self.state_store.mark_event_processed(event.event_id)
+        self._inflight.add(event.event_id)
         task = asyncio.create_task(self._dispatch(event))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -82,9 +91,17 @@ class EventServer:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("[event] processing failed: %s", event.event_id)
+            logger.exception(
+                "[event] processing failed, event stays unprocessed: %s", event.event_id
+            )
+        else:
+            await self.state_store.mark_event_processed(event.event_id)
+        finally:
+            self._inflight.discard(event.event_id)
 
     def _authorized(self, request: web.Request) -> bool:
         if not self.token:
             return False
-        return request.headers.get("Authorization") == f"Bearer {self.token}"
+        header = request.headers.get("Authorization") or ""
+        expected = f"Bearer {self.token}"
+        return hmac.compare_digest(header, expected)

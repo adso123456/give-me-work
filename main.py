@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""AstrBot 求职管理插件入口。"""
+"""AstrBot 求职管理插件入口。
+
+存储层使用飞书开放平台多维表格 API（tenant_access_token），
+不再依赖 Playwright 抓取网页（原方案无法读写 canvas 网格）。
+"""
 
 from __future__ import annotations
 
@@ -15,24 +19,32 @@ from astrbot.core.message.components import Image, Plain
 from astrbot.core.message.message_event_result import MessageChain
 
 from .agent import AgentResult, JobAgentService
+from .cards.actions import parse_action_index
+from .cards.image_renderer import CardImageRenderer
 from .cards.models import JobNotificationCard
 from .cards.napcat_renderer import NapCatCardRenderer
-from .cards.text_renderer import TextCardRenderer
+from .cards.text_renderer import ACTION_LABELS, TextCardRenderer
 from .events.mock import MockEventSource
 from .events.server import EventServer
+from .feishu.api_adapter import FeishuAdapterError, FeishuApiAdapter, parse_table_url
 from .feishu.tools import FeishuTools
-from .feishu.login_flow import run_feishu_login
-from .feishu.web_adapter import FeishuAdapterError, FeishuWebAdapter
 from .feishu.write_test import run_table_write_test
 from .models import CardAction, RecruitEvent
 from .state_store import StateStore
 
+try:  # AstrBot 4.27+ 提供，用于把数据写到 data/plugin_data/<plugin>
+    from astrbot.api.star import StarTools
+except Exception:  # pragma: no cover - 兼容旧版本
+    StarTools = None  # type: ignore[assignment]
+
 
 PLUGIN_NAME = "astrbot_plugin_job_agent"
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.3.0"
 
 
 class _ProviderLlmClient:
+    """把 AstrBot Provider 包成 Agent 需要的 complete(prompt, system_prompt) 接口。"""
+
     def __init__(self, provider: Any):
         self.provider = provider
 
@@ -45,14 +57,14 @@ class _ProviderLlmClient:
         return str(getattr(response, "completion_text", "") or "")
 
 
-class _UnavailableLlm:
-    async def complete(self, prompt: str, system_prompt: str) -> str:
-        return '{"type":"final","summary":"未找到可用的 LLM Provider","card_type":"system"}'
-
-
 class _MissingFeishuAdapter:
+    """未配置飞书 API 时的占位实现：所有操作返回可读错误，不假装成功。"""
+
+    def __init__(self, reason: str = "未配置飞书应用凭证"):
+        self.reason = reason
+
     async def _fail(self):
-        raise FeishuAdapterError("未配置 feishu_table_url")
+        raise FeishuAdapterError(self.reason)
 
     async def search_records(self, query):
         return await self._fail()
@@ -72,13 +84,10 @@ class _MissingFeishuAdapter:
     async def check_access(self):
         return await self._fail()
 
-    def has_storage_state(self):
-        return False
-
-    async def start_qr_login(self, qr_path):
+    async def list_fields(self, refresh: bool = False):
         return await self._fail()
 
-    async def wait_for_qr_login(self):
+    async def field_names(self):
         return await self._fail()
 
     async def close(self):
@@ -88,7 +97,7 @@ class _MissingFeishuAdapter:
 @register(
     PLUGIN_NAME,
     "adso",
-    "求职管理 Agent：维护飞书投递记录并通过 QQ 推送招聘通知",
+    "求职管理 Agent：维护飞书投递记录并通过 QQ 推送招聘通知（开放平台 API 版）",
     PLUGIN_VERSION,
 )
 class JobAgentPlugin(Star):
@@ -97,34 +106,31 @@ class JobAgentPlugin(Star):
         self.context = context
         self.config = config
         self.state: StateStore | None = None
-        self.adapter: FeishuWebAdapter | _MissingFeishuAdapter | None = None
+        self.adapter: Any = None
         self.tools: FeishuTools | None = None
         self.agent: JobAgentService | None = None
         self.event_server: EventServer | None = None
         self._provider = None
         self._data_dir = self._resolve_data_dir()
+        self._adapter_reason = ""
+
+    # ------------------------------------------------------------ 生命周期
 
     async def initialize(self):
         self._data_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_state()
         self.state = StateStore(self._data_dir / "job_agent_state.json")
         await self.state.load()
 
-        table_url = str(self._cfg("feishu_table_url", "") or "").strip()
-        if table_url:
-            self.adapter = FeishuWebAdapter(
-                table_url,
-                headless=bool(self._cfg("browser_headless", True)),
-                debug_dir=self._data_dir / "debug",
-                storage_state_path=self._data_dir / "feishu_storage_state.json",
-            )
-        else:
-            self.adapter = _MissingFeishuAdapter()
+        self.adapter = self._build_adapter()
         self.tools = FeishuTools(self.adapter)
-        self._provider = self._resolve_provider()
-        self.agent = JobAgentService(
-            llm=_ProviderLlmClient(self._provider) if self._provider else _UnavailableLlm(),
-            tools=self.tools,
-        )
+
+        self._provider = None
+        self.agent = None
+        if await self._ensure_agent() is None:
+            logger.warning(
+                "[job-agent] 初始化时未解析到 LLM Provider，将在首次调用时重试（可在插件配置里填写 provider_id）"
+            )
 
         token = str(self._cfg("webhook_token", "") or "").strip()
         if token:
@@ -132,18 +138,31 @@ class JobAgentPlugin(Star):
                 token=token,
                 state_store=self.state,
                 on_event=self._handle_webhook_event,
-                host=str(self._cfg("webhook_host", "0.0.0.0")),
+                host=str(self._cfg("webhook_host", "127.0.0.1")),
                 port=int(self._cfg("webhook_port", 6190)),
             )
             await self.event_server.start()
-            logger.info("[job-agent] webhook started on port %s", self._cfg("webhook_port", 6190))
-        logger.info("[job-agent] plugin initialized")
+            logger.info(
+                "[job-agent] webhook started on %s:%s",
+                self._cfg("webhook_host", "127.0.0.1"),
+                self._cfg("webhook_port", 6190),
+            )
+        else:
+            logger.info("[job-agent] webhook 未启用（webhook_token 为空）")
+        logger.info(
+            "[job-agent] plugin initialized (data=%s, feishu=%s, llm=%s)",
+            self._data_dir,
+            "api" if isinstance(self.adapter, FeishuApiAdapter) else "未配置",
+            "ok" if self.agent else "缺失",
+        )
 
     async def terminate(self):
         if self.event_server:
             await self.event_server.stop()
         if self.adapter:
             await self.adapter.close()
+
+    # ------------------------------------------------------------ 指令
 
     @filter.command("job_bind")
     async def job_bind(self, event: AstrMessageEvent):
@@ -154,20 +173,26 @@ class JobAgentPlugin(Star):
     @filter.command("job_status")
     async def job_status(self, event: AstrMessageEvent):
         assert self.state is not None
-        access = "未检查"
-        if self.adapter:
+        access = "未配置"
+        fields = "—"
+        if isinstance(self.adapter, FeishuApiAdapter):
             try:
-                access = "可访问" if await self.adapter.check_access() else "不可访问"
+                names = await self.adapter.field_names()
+                access = "可访问"
+                fields = f"{len(names)} 个：{'、'.join(names)}"
             except Exception as exc:
                 access = f"不可访问（{self._short_error(exc)}）"
-        provider = "已配置" if self._provider else "未找到"
+        elif self.adapter is not None:
+            access = f"不可访问（{self._short_error(FeishuAdapterError(self._adapter_reason))}）"
+        provider = "已配置" if await self._ensure_agent() is not None else "未找到（Agent 不可用）"
         webhook = "运行中" if self.event_server else "未启用（缺少 webhook_token）"
         pending = await self.state.pending_card_count()
         yield event.plain_result(
             "\n".join(
                 [
-                    f"插件状态：运行中 v{PLUGIN_VERSION}",
-                    f"飞书是否可访问：{access}",
+                    f"插件状态：运行中 v{PLUGIN_VERSION}（飞书开放平台 API）",
+                    f"飞书表格：{access}",
+                    f"表格字段：{fields}",
                     f"LLM Provider：{provider}",
                     f"Webhook 状态：{webhook}",
                     f"已绑定 UMO：{self.state.bound_umo or '未绑定'}",
@@ -178,17 +203,11 @@ class JobAgentPlugin(Star):
 
     @filter.command("job_feishu_login")
     async def job_feishu_login(self, event: AstrMessageEvent):
-        assert self.adapter is not None
-        qr_path = self._data_dir / "debug" / "feishu_login_qr.png"
-
-        async def send_qr(path: Path):
-            await self._send_feishu_qr(event.unified_msg_origin, path)
-
-        try:
-            result = await run_feishu_login(self.adapter, send_qr, qr_path)
-            yield event.plain_result(f"✅ {result}")
-        except Exception as exc:
-            yield event.plain_result(f"❌ 飞书登录失败：{self._short_error(exc)}")
+        yield event.plain_result(
+            "ℹ️ 当前使用飞书开放平台 API，无需扫码登录。\n"
+            "如提示权限不足(91403)：请在开放平台给应用加 bitable:app 权限并发布版本，"
+            "再把该多维表格添加为应用可编辑的文档。"
+        )
 
     @filter.command("job_table_test")
     async def job_table_test(self, event: AstrMessageEvent):
@@ -224,16 +243,104 @@ class JobAgentPlugin(Star):
 
     @filter.command("job_action")
     async def job_action(self, event: AstrMessageEvent):
-        assert self.state is not None and self.agent is not None
         parts = event.message_str.strip().lstrip("/").split()
         if len(parts) < 3:
             yield event.plain_result("用法：/job_action <token> <action>")
             return
-        token, action_name = parts[1], parts[2]
+        yield event.plain_result(await self._apply_card_action(parts[1], parts[2]))
+
+    @filter.regex(r"^\s*[1-9]\s*$")
+    async def job_quick_action(self, event: AstrMessageEvent):
+        """回复卡片上的数字即可执行动作（只有存在待处理卡片时才拦截）。"""
+        if self.state is None:
+            return
+        pending = await self.state.latest_pending_card(event.unified_msg_origin)
+        if pending is None:
+            return
+        action_name = parse_action_index(event.message_str, list(pending.get("actions") or []))
+        if action_name is None:
+            return
+        event.stop_event()
+        token = str(pending.get("token") or "")
+        yield event.plain_result(await self._apply_card_action(token, action_name))
+
+    @filter.command("job")
+    async def job_command(self, event: AstrMessageEvent):
+        missing = await self._missing_agent()
+        if missing is not None:
+            yield event.plain_result(self._result_text(missing))
+            return
+        command = event.message_str.strip()
+        if command.startswith("/job"):
+            command = command[4:].strip()
+        if not command:
+            yield event.plain_result("用法：/job <自然语言求职记录或查询>")
+            return
+        result = await self.agent.handle_command(command)
+        yield event.plain_result(self._result_text(result))
+
+    # ------------------------------------------------------------ 事件处理
+
+    async def _handle_webhook_event(self, event: RecruitEvent):
+        target = self.state.bound_umo if self.state else None
+        if not target:
+            logger.warning("[event] %s 收到但尚未绑定通知会话", event.event_id)
+            raise RuntimeError("no_bound_umo")
+        await self._handle_event(event, target)
+
+    async def _handle_event(self, event: RecruitEvent, target_umo: str | None) -> AgentResult:
+        logger.info("[event] received %s type=%s", event.event_id, event.event_type)
+        missing = await self._missing_agent()
+        if missing is not None:
+            return missing
+        assert self.agent is not None and self.state is not None
+        result = await self.agent.handle_event(event)
+        if result.error:
+            logger.warning("[event] agent failed %s error=%s", event.event_id, result.error)
+            if target_umo:
+                await self._safe_send(target_umo, f"⚠️ 招聘事件处理失败：{result.summary}")
+            return result
+        if not target_umo:
+            result.error = "no_bound_umo"
+            result.summary = "Agent 已处理，但尚未绑定通知会话"
+            return result
+
+        token = secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:10]
+        card = self._build_card(event, result)
+        try:
+            await self._send_card(target_umo, card, token)
+            await self.state.add_pending_card(
+                {
+                    "card_id": card.card_id,
+                    "event_id": event.event_id,
+                    "record_id": result.record_id,
+                    "token": token,
+                    "umo": target_umo,
+                    "actions": list(card.actions),
+                }
+            )
+            logger.info("[card] send card=%s event=%s", card.card_id, event.event_id)
+        except Exception as exc:
+            logger.warning("[card] send failed event=%s error=%s", event.event_id, self._short_error(exc))
+            if target_umo:
+                await self._safe_send(target_umo, f"⚠️ 通知卡片发送失败：{self._short_error(exc)}")
+        logger.info("[event] completed %s", event.event_id)
+        return result
+
+    async def _apply_card_action(self, token: str, action_name: str) -> str:
+        assert self.state is not None
+        missing = await self._missing_agent()
+        if missing is not None:
+            return self._result_text(missing)
         pending = await self.state.get_pending_card_by_token(token)
         if pending is None:
-            yield event.plain_result("❌ 未找到待处理卡片，token 可能已失效")
-            return
+            return "❌ 未找到待处理卡片，token 可能已失效"
+        if str(pending.get("status") or "pending") != "pending":
+            return "ℹ️ 这张卡片已经处理过了，未重复执行"
+        allowed = [str(item) for item in (pending.get("actions") or [])]
+        if allowed and action_name not in allowed:
+            return f"❌ 这张卡片只支持：{'、'.join(allowed)}"
+        assert self.agent is not None
         try:
             action = CardAction(
                 action_id=f"action_{time.time_ns()}",
@@ -244,72 +351,108 @@ class JobAgentPlugin(Star):
             )
             result = await self.agent.handle_action(action)
             if result.error:
-                yield event.plain_result(f"❌ 未同步飞书：{result.summary}")
-                return
+                return f"❌ 未同步飞书：{result.summary}"
             await self.state.complete_card(token)
-            yield event.plain_result(f"✅ 已同步飞书\n{result.summary}")
+            if result.suggested_reply:
+                return f"✅ 已同步飞书\n{result.summary}\n建议回复：{result.suggested_reply}"
+            return f"✅ 已同步飞书\n{result.summary}"
         except Exception as exc:
-            yield event.plain_result(f"❌ 未同步飞书：{self._short_error(exc)}")
+            return f"❌ 未同步飞书：{self._short_error(exc)}"
 
-    @filter.command("job")
-    async def job_command(self, event: AstrMessageEvent):
-        assert self.agent is not None
-        command = event.message_str.strip()
-        if command.startswith("/job"):
-            command = command[4:].strip()
-        if not command:
-            yield event.plain_result("用法：/job <自然语言求职记录或查询>")
-            return
-        result = await self.agent.handle_command(command)
-        yield event.plain_result(self._result_text(result))
-
-    async def _handle_webhook_event(self, event: RecruitEvent):
-        target = self.state.bound_umo if self.state else None
-        await self._handle_event(event, target)
-
-    async def _handle_event(self, event: RecruitEvent, target_umo: str | None) -> AgentResult:
-        assert self.agent is not None and self.state is not None
-        logger.info("[event] received %s type=%s", event.event_id, event.event_type)
-        result = await self.agent.handle_event(event)
-        if result.error:
-            logger.warning("[event] agent failed %s error=%s", event.event_id, result.error)
-            return result
-        if not target_umo:
-            result.error = "no_bound_umo"
-            result.summary = "Agent 已处理，但尚未绑定通知会话"
-            return result
-
-        token = secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:10]
-        card = self._build_card(event, result)
-        text = self._render_card(card, token)
-        try:
-            await self._send_text(target_umo, text)
-            await self.state.add_pending_card(
-                {
-                    "card_id": card.card_id,
-                    "event_id": event.event_id,
-                    "record_id": result.record_id,
-                    "token": token,
-                    "umo": target_umo,
-                }
+    async def _send_card(self, umo: str, card: JobNotificationCard, token: str) -> None:
+        mode = str(self._cfg("card_mode", "auto") or "auto").lower()
+        image_path: Path | None = None
+        if mode in {"auto", "image", "napcat"}:
+            try:
+                image_path = self._render_card_image(card, token)
+            except Exception as exc:
+                logger.warning("[card] 图片卡片渲染失败，回退纯文本：%s", self._short_error(exc))
+        if image_path is not None:
+            chain = MessageChain(
+                chain=[
+                    Image.fromFileSystem(str(image_path)),
+                    Plain(self._card_text(card, token)),
+                ]
             )
-            logger.info("[card] send card=%s event=%s", card.card_id, event.event_id)
-        except Exception as exc:
-            logger.warning("[card] send failed event=%s error=%s", event.event_id, self._short_error(exc))
-        logger.info("[event] completed %s", event.event_id)
-        return result
+        else:
+            chain = MessageChain(chain=[Plain(self._render_card(card, token))])
+        await self.context.send_message(umo, chain)
+
+    def _render_card_image(self, card: JobNotificationCard, token: str) -> Path:
+        renderer = CardImageRenderer()
+        if not renderer.available():
+            raise RuntimeError("缺少 Pillow 或中文字体")
+        cards_dir = self._data_dir / "cards"
+        # 图片只保留「标题 + 消息内容」，其余用文本发，方便复制建议回复
+        path = renderer.render(card, token, cards_dir / f"{card.card_id}.png", minimal=True)
+        self._prune_card_images(cards_dir)
+        return path
+
+    @staticmethod
+    def _prune_card_images(cards_dir: Path, keep: int = 50) -> None:
+        try:
+            files = sorted(cards_dir.glob("card_*.png"), key=lambda item: item.stat().st_mtime)
+        except OSError:
+            return
+        for stale in files[:-keep] if len(files) > keep else []:
+            try:
+                stale.unlink()
+            except OSError:
+                continue
+
+    @staticmethod
+    def _card_text(card: JobNotificationCard, token: str) -> str:
+        """跟随图片发送的纯文本部分：建议回复 + 动作指令（可直接复制）。"""
+        lines: list[str] = []
+        meta = "  ·  ".join(part for part in (card.company, card.position) if part)
+        if meta:
+            lines.append(meta)
+        if card.contact:
+            lines.append(f"HR：{card.contact}")
+        if card.suggested_reply:
+            lines.extend(["", "🤖 建议回复（复制即用，未替你发送）：", f"“{card.suggested_reply}”"])
+        if card.status_text:
+            lines.extend(["", f"当前：{card.status_text}"])
+        lines.extend(["", "回复数字即可同步飞书："])
+        for index, action in enumerate(card.actions, start=1):
+            lines.append(f"{index}. {ACTION_LABELS.get(action, action)}")
+        lines.append(f"（也可发送 /job_action {token} <动作>）")
+        return "\n".join(lines)
+
+    async def _safe_send(self, umo: str, text: str) -> None:
+        try:
+            await self._send_text(umo, text)
+        except Exception as exc:  # 通知失败不应再抛异常打断主流程
+            logger.warning("[card] fallback notify failed error=%s", self._short_error(exc))
 
     async def _send_text(self, umo: str, text: str) -> None:
         await self.context.send_message(umo, MessageChain(chain=[Plain(text)]))
 
-    async def _send_feishu_qr(self, umo: str, qr_path: Path) -> None:
-        chain = MessageChain(
-            chain=[
-                Plain("请使用飞书或豆包 App 扫描二维码登录，扫码完成后请等待回复。"),
-                Image.fromFileSystem(str(qr_path)),
-            ]
+    # ------------------------------------------------------------ 内部工具
+
+    def _missing_agent_sync_note(self) -> AgentResult:
+        return AgentResult(
+            summary="未配置可用的 LLM Provider（请在 AstrBot 中配置模型，或在插件配置里填写 provider_id）",
+            error="no_llm",
         )
-        await self.context.send_message(umo, chain)
+
+    async def _missing_agent(self) -> AgentResult | None:
+        if await self._ensure_agent() is not None:
+            return None
+        return self._missing_agent_sync_note()
+
+    async def _ensure_agent(self) -> JobAgentService | None:
+        """懒解析 Provider：插件加载可能早于 Provider 注册，或用户稍后才配置模型。"""
+        if self.agent is not None:
+            return self.agent
+        if self.tools is None:
+            return None
+        self._provider = await self._resolve_provider()
+        if self._provider is None:
+            return None
+        logger.info("[job-agent] 已解析到 LLM Provider，Agent 就绪")
+        self.agent = JobAgentService(llm=_ProviderLlmClient(self._provider), tools=self.tools)
+        return self.agent
 
     def _build_card(self, event: RecruitEvent, result: AgentResult) -> JobNotificationCard:
         card_type = result.card_type if result.card_type in {"hr_reply", "resume_request", "interview", "system"} else "system"
@@ -344,25 +487,80 @@ class JobAgentPlugin(Star):
             try:
                 return NapCatCardRenderer().render(card, token)
             except Exception:
-                pass
+                logger.debug("[job-agent] napcat renderer failed", exc_info=True)
         return TextCardRenderer().render(card, token)
 
-    def _resolve_provider(self):
+    def _build_adapter(self) -> Any:
+        app_id = str(self._cfg("app_id", "") or "").strip()
+        app_secret = str(self._cfg("app_secret", "") or "").strip()
+        app_token = str(self._cfg("app_token", "") or "").strip()
+        table_id = str(self._cfg("table_id", "") or "").strip()
+        table_url = str(self._cfg("feishu_table_url", "") or "").strip()
+        if not app_token or not table_id:
+            url_app_token, url_table_id = parse_table_url(table_url)
+            app_token = app_token or (url_app_token or "")
+            table_id = table_id or (url_table_id or "")
+        missing = [
+            name
+            for name, value in (
+                ("app_id", app_id),
+                ("app_secret", app_secret),
+                ("app_token/feishu_table_url", app_token),
+                ("table_id/feishu_table_url", table_id),
+            )
+            if not value
+        ]
+        if missing:
+            self._adapter_reason = "飞书 API 配置不完整，缺少：" + "、".join(missing)
+            logger.warning("[job-agent] %s", self._adapter_reason)
+            return _MissingFeishuAdapter(self._adapter_reason)
+        return FeishuApiAdapter(app_id, app_secret, app_token, table_id)
+
+    async def _resolve_provider(self):
         provider_id = str(self._cfg("provider_id", "") or "").strip()
         if provider_id:
             try:
                 provider = self.context.get_provider_by_id(provider_id)
                 if provider:
                     return provider
+                logger.warning("[job-agent] provider_id=%s 未找到，回退到默认 Provider", provider_id)
             except Exception:
-                logger.warning("[job-agent] configured provider unavailable")
+                logger.warning("[job-agent] configured provider unavailable", exc_info=True)
+        getter = getattr(self.context, "get_using_provider_async", None)
+        if getter is not None:
+            try:
+                provider = await getter()
+                if provider is not None:
+                    return provider
+            except Exception:
+                logger.warning("[job-agent] get_using_provider_async failed", exc_info=True)
         try:
             return self.context.get_using_provider()
         except Exception:
+            logger.warning("[job-agent] get_using_provider failed", exc_info=True)
             return None
 
     def _resolve_data_dir(self) -> Path:
+        if StarTools is not None:
+            try:
+                return StarTools.get_data_dir(PLUGIN_NAME)
+            except Exception as exc:  # pragma: no cover - 依赖运行环境
+                logger.warning("[job-agent] StarTools.get_data_dir 失败(%s)，回退到 plugins/plugin_data", exc)
         return Path(__file__).resolve().parents[1] / "plugin_data" / PLUGIN_NAME
+
+    def _migrate_legacy_state(self) -> None:
+        """把旧版写在 plugins/plugin_data 下的状态文件搬过来（只搬一次）。"""
+        legacy = Path(__file__).resolve().parents[1] / "plugin_data" / PLUGIN_NAME
+        if legacy == self._data_dir or not legacy.exists():
+            return
+        source = legacy / "job_agent_state.json"
+        target = self._data_dir / "job_agent_state.json"
+        if source.exists() and not target.exists():
+            try:
+                target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+                logger.info("[job-agent] 已迁移旧状态文件 %s", source)
+            except OSError as exc:
+                logger.warning("[job-agent] 迁移旧状态文件失败: %s", exc)
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         try:

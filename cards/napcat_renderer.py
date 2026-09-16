@@ -1,6 +1,7 @@
-"""NapCat 兼容渲染器。
+"""NapCat / QQ 渲染器。
 
-V0.1 不依赖 QQ 原生按钮回调，使用 Markdown 风格文本并保留纯文本兼容性。
+QQ 文本消息不解析 Markdown，因此这里只输出纯文本（不输出 ** 等标记）。
+保留独立类是为了将来接入 QQ 原生按钮卡片。
 """
 
 from __future__ import annotations
@@ -14,8 +15,4 @@ class NapCatCardRenderer:
         self._fallback = TextCardRenderer()
 
     def render(self, card: JobNotificationCard, token: str) -> str:
-        try:
-            text = self._fallback.render(card, token)
-            return f"**{card.title}**\n{text[len(card.title):].lstrip()}"
-        except Exception:
-            return self._fallback.render(card, token)
+        return self._fallback.render(card, token)

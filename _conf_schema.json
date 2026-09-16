@@ -4,27 +4,47 @@
     "type": "bool",
     "default": true
   },
+  "app_id": {
+    "description": "飞书自建应用 App ID",
+    "type": "string",
+    "hint": "open.feishu.cn/app 创建的应用，如 cli_xxx",
+    "default": ""
+  },
+  "app_secret": {
+    "description": "飞书自建应用 App Secret",
+    "type": "string",
+    "hint": "只用于本机换取 tenant_access_token，不会写入日志",
+    "default": ""
+  },
+  "feishu_table_url": {
+    "description": "飞书多维表格 URL",
+    "type": "string",
+    "hint": "用于自动解析 app_token 与 table_id；解析失败时请手填下面两项",
+    "default": ""
+  },
+  "app_token": {
+    "description": "多维表格 app_token（可选）",
+    "type": "string",
+    "hint": "URL 中 /base/<app_token> 这一段；留空则从 feishu_table_url 解析",
+    "default": ""
+  },
+  "table_id": {
+    "description": "数据表 table_id（可选）",
+    "type": "string",
+    "hint": "URL 中 table=<table_id> 这一段；留空则从 feishu_table_url 解析",
+    "default": ""
+  },
   "provider_id": {
     "description": "LLM Provider ID",
     "type": "string",
     "hint": "留空时使用 AstrBot 当前默认 Provider",
     "default": ""
   },
-  "feishu_table_url": {
-    "description": "飞书多维表格 URL",
-    "type": "string",
-    "hint": "不要写入日志；服务器上的 Playwright 需要能够访问并登录该表格",
-    "default": ""
-  },
-  "browser_headless": {
-    "description": "Playwright 无头模式",
-    "type": "bool",
-    "default": true
-  },
   "webhook_host": {
     "description": "Webhook 监听地址",
     "type": "string",
-    "default": "0.0.0.0"
+    "hint": "默认只监听本机；如需外部招聘事件源访问再改成 0.0.0.0 并配置反向代理",
+    "default": "127.0.0.1"
   },
   "webhook_port": {
     "description": "Webhook 监听端口",

@@ -63,13 +63,24 @@ class JobAgentService:
     async def handle_command(self, command: str) -> AgentResult:
         return await self._run("user_command", {"command": command})
 
+    async def _table_fields(self) -> list[str]:
+        """读取表格真实字段名；失败不影响主流程。"""
+        getter = getattr(self.tools, "field_names", None)
+        if getter is None:
+            return []
+        try:
+            return list(await getter())
+        except Exception:
+            return []
+
     async def _run(self, kind: str, payload: dict[str, Any]) -> AgentResult:
         history: list[dict[str, Any]] = []
         record_id: str | None = payload.get("record_id")
         repaired = False
+        table_fields = await self._table_fields()
 
         for step in range(1, self.max_steps + 1):
-            prompt = build_agent_prompt(kind, payload, history)
+            prompt = build_agent_prompt(kind, payload, history, table_fields)
             raw = await self.llm.complete(prompt, SYSTEM_PROMPT)
             parsed = self._parse_json(raw)
             if parsed is None:

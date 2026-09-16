@@ -30,11 +30,19 @@ SYSTEM_PROMPT = """你是用户的求职管理 Agent。
 """
 
 
-def build_agent_prompt(kind: str, payload: dict[str, Any], history: list[dict[str, Any]]) -> str:
+def build_agent_prompt(
+    kind: str,
+    payload: dict[str, Any],
+    history: list[dict[str, Any]],
+    table_fields: list[str] | None = None,
+) -> str:
     return json.dumps(
         {
             "input_kind": kind,
             "input": payload,
+            "table_fields": table_fields or [],
+            "table_fields_note": "create_job/update_job 的 fields 只能用 table_fields 里的字段名；"
+            "投递记录ID、创建人、创建时间、修改人、更新时间由飞书自动维护，禁止写入。",
             "tool_history": history,
             "instruction": "基于当前输入和工具结果继续完成任务；没有必要时直接 final。",
         },
