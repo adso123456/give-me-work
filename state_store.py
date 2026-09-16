@@ -11,6 +11,7 @@ from typing import Any
 MAX_PROCESSED_EVENTS = 1000
 PENDING_CARD_TTL_SECONDS = 30 * 24 * 3600
 PENDING_DELETE_TTL_SECONDS = 300
+MAX_PENDING_CARDS = 200
 
 
 def _default_state() -> dict[str, Any]:
@@ -128,20 +129,44 @@ class StateStore:
         async with self._lock:
             return sum(1 for card in self._state["pending_cards"] if card.get("status") == "pending")
 
-    async def prune_cards(self, ttl_seconds: int = PENDING_CARD_TTL_SECONDS) -> int:
-        """清掉过期的已完成卡片，返回清理条数。"""
-        deadline = time.time() - ttl_seconds
+    async def prune_cards(
+        self,
+        ttl_seconds: int = PENDING_CARD_TTL_SECONDS,
+        pending_ttl_seconds: int | None = None,
+        max_cards: int = MAX_PENDING_CARDS,
+    ) -> int:
+        """清掉过期卡片并给总量封顶，返回清理条数。
+
+        - 已完成卡片：超过 ttl_seconds 就删；
+        - 待处理卡片：超过 pending_ttl_seconds（默认同上）也删，避免"没人理的卡片"永久堆积；
+        - 总量超过 max_cards 时，按时间从旧到新丢弃（优先丢已完成的）。
+        """
+        now = time.time()
+        finished_deadline = now - ttl_seconds
+        pending_deadline = now - (ttl_seconds if pending_ttl_seconds is None else pending_ttl_seconds)
         async with self._lock:
-            cards = self._state["pending_cards"]
             kept: list[dict[str, Any]] = []
             removed = 0
-            for card in cards:
+            for card in self._state["pending_cards"]:
                 created = float(card.get("created_at") or 0)
                 finished = str(card.get("status") or "pending") != "pending"
-                if finished and created and created < deadline:
+                deadline = finished_deadline if finished else pending_deadline
+                if created and created < deadline:
                     removed += 1
                     continue
                 kept.append(card)
+
+            if max_cards and len(kept) > max_cards:
+                # 先丢已完成的，再按时间从旧到新丢
+                kept.sort(
+                    key=lambda card: (
+                        str(card.get("status") or "pending") != "pending",
+                        float(card.get("created_at") or 0),
+                    )
+                )
+                removed += len(kept) - max_cards
+                kept = kept[-max_cards:]
+
             if removed:
                 self._state["pending_cards"] = kept
                 alive = {str(card.get("token")) for card in kept}

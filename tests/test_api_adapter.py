@@ -14,8 +14,10 @@ FIELDS = [
     {"field_id": "fld3", "field_name": "公司名称", "type": 1, "ui_type": "Text"},
     {"field_id": "fld4", "field_name": "投递日期", "type": 5, "ui_type": "DateTime"},
     {"field_id": "fld5", "field_name": "简历文件", "type": 17, "ui_type": "Attachment"},
-    {"field_id": "fld6", "field_name": "投递状态", "type": 3, "ui_type": "SingleSelect"},
-    {"field_id": "fld7", "field_name": "技能标签", "type": 4, "ui_type": "MultiSelect"},
+    {"field_id": "fld6", "field_name": "投递状态", "type": 3, "ui_type": "SingleSelect",
+     "property": {"options": [{"name": "已投递"}, {"name": "沟通中"}]}},
+    {"field_id": "fld7", "field_name": "技能标签", "type": 4, "ui_type": "MultiSelect",
+     "property": {"options": [{"name": "Python"}, {"name": "RAG"}]}},
     {"field_id": "fld8", "field_name": "已读", "type": 7, "ui_type": "Checkbox"},
     {"field_id": "fld9", "field_name": "创建时间", "type": 1001, "ui_type": "CreatedTime"},
 ]
@@ -186,9 +188,96 @@ def test_list_records_honours_limit():
     assert len(adapter.calls) == 1
 
 
-def test_search_records_filters_on_plain_fields():
+def test_search_records_uses_server_side_filter():
     adapter = StubAdapter(
         responses=[
+            {
+                "data": {
+                    "items": [{"record_id": "r1", "fields": {"公司名称": "字节跳动"}}],
+                    "has_more": False,
+                }
+            }
+        ]
+    )
+    records = run(adapter.search_records("字节"))
+    method, path, kwargs = adapter.calls[0]
+    assert (method, path) == ("POST", "/bitable/v1/apps/app_tok/tables/tbl_tok/records/search")
+    body = kwargs["json_body"]
+    assert body["filter"]["conjunction"] == "or"
+    condition_names = [item["field_name"] for item in body["filter"]["conditions"]]
+    # 只有文本字段用 contains；单选/多选字段的取值必须命中已有选项，否则整个 filter 会被拒
+    assert condition_names == ["应聘岗位", "公司名称"]
+    assert body["filter"]["conditions"][0] == {
+        "field_name": "应聘岗位",
+        "operator": "contains",
+        "value": ["字节"],
+    }
+    assert [record["record_id"] for record in records] == ["r1"]
+
+
+def test_search_records_uses_is_when_keyword_matches_select_option():
+    adapter = StubAdapter(
+        responses=[{"data": {"items": [{"record_id": "r1", "fields": {}}], "has_more": False}}]
+    )
+    run(adapter.search_records("已投递"))
+    conditions = adapter.calls[0][2]["json_body"]["filter"]["conditions"]
+    by_name = {item["field_name"]: item for item in conditions}
+    assert by_name["投递状态"]["operator"] == "is"
+    assert by_name["投递状态"]["value"] == ["已投递"]
+    assert by_name["公司名称"]["operator"] == "contains"
+    # 「已投递」不是 技能标签 的选项，不能加进去，否则整个 filter 会被飞书拒绝
+    assert "技能标签" not in by_name
+
+
+def test_search_records_includes_multiselect_option_when_matched():
+    adapter = StubAdapter(
+        responses=[{"data": {"items": [{"record_id": "r1", "fields": {}}], "has_more": False}}]
+    )
+    run(adapter.search_records("Python"))
+    conditions = adapter.calls[0][2]["json_body"]["filter"]["conditions"]
+    by_name = {item["field_name"]: item for item in conditions}
+    assert by_name["技能标签"]["operator"] == "is"
+    assert by_name["技能标签"]["value"] == ["Python"]
+    assert "投递状态" not in by_name
+
+
+def test_search_records_degrades_to_text_only_when_filter_rejected():
+    adapter = StubAdapter(
+        responses=[
+            FeishuAdapterError("飞书 API 错误 1254018: InvalidFilter"),
+            {"data": {"items": [{"record_id": "r1", "fields": {}}], "has_more": False}},
+        ]
+    )
+    records = run(adapter.search_records("已投递"))
+    assert [record["record_id"] for record in records] == ["r1"]
+    assert len(adapter.calls) == 2
+    second_conditions = adapter.calls[1][2]["json_body"]["filter"]["conditions"]
+    assert [item["field_name"] for item in second_conditions] == ["应聘岗位", "公司名称"]
+
+
+def test_search_records_follows_page_token():
+    adapter = StubAdapter(
+        responses=[
+            {
+                "data": {
+                    "items": [{"record_id": "r1", "fields": {}}],
+                    "has_more": True,
+                    "page_token": "p2",
+                }
+            },
+            {"data": {"items": [{"record_id": "r2", "fields": {}}], "has_more": False}},
+        ]
+    )
+    records = run(adapter.search_records("x"))
+    assert [record["record_id"] for record in records] == ["r1", "r2"]
+    assert adapter.calls[1][2]["params"] == {"page_token": "p2"}
+
+
+def test_search_records_falls_back_to_local_match_when_api_keeps_failing():
+    # 「字节」只命中文本字段，没有可退化的余地：一次搜索失败后直接回退本地匹配
+    adapter = StubAdapter(
+        responses=[
+            FeishuAdapterError("飞书 API 错误 1254018: InvalidFilter"),
             {
                 "data": {
                     "items": [
@@ -197,11 +286,39 @@ def test_search_records_filters_on_plain_fields():
                     ],
                     "has_more": False,
                 }
-            }
+            },
         ]
     )
     records = run(adapter.search_records("字节"))
     assert [record["record_id"] for record in records] == ["r1"]
+    assert adapter.calls[0][1].endswith("/records/search")
+    assert adapter.calls[1][0] == "GET"
+
+
+def test_search_records_without_searchable_fields_uses_local_match():
+    adapter = StubAdapter(
+        fields=[{"field_id": "f1", "field_name": "投递记录ID", "type": 1005, "ui_type": "AutoNumber"}],
+        responses=[
+            {
+                "data": {
+                    "items": [{"record_id": "r1", "fields": {"投递记录ID": "13"}}],
+                    "has_more": False,
+                }
+            }
+        ],
+    )
+    records = run(adapter.search_records("13"))
+    assert [record["record_id"] for record in records] == ["r1"]
+    assert adapter.calls[0][0] == "GET"
+
+
+def test_search_records_without_keyword_lists_all_records():
+    adapter = StubAdapter(
+        responses=[{"data": {"items": [{"record_id": "r1", "fields": {}}], "has_more": False}}]
+    )
+    records = run(adapter.search_records("   "))
+    assert [record["record_id"] for record in records] == ["r1"]
+    assert adapter.calls[0][0] == "GET"
 
 
 @pytest.mark.parametrize("code", ["1254303", "1254043"])

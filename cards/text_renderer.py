@@ -1,4 +1,8 @@
-"""始终可用的纯文本卡片渲染器。"""
+"""始终可用的纯文本卡片渲染器。
+
+与图片卡片保持一致：动作既给出编号（可直接回复数字），也保留 /job_action 命令，
+这样 Pillow 或中文字体缺失、回退成纯文本时功能不打折。
+"""
 
 from __future__ import annotations
 
@@ -30,8 +34,9 @@ class TextCardRenderer:
         if card.status_text:
             lines.extend(["", f"当前：{card.status_text}"])
         if card.actions:
-            lines.extend(["", "请在完成实际操作后选择："])
-            for action in card.actions:
+            lines.extend(["", "回复数字即可同步飞书："])
+            for index, action in enumerate(card.actions, start=1):
                 label = ACTION_LABELS.get(action, action)
-                lines.append(f"[{label}] /job_action {token} {action}")
+                lines.append(f"{index}. {label}")
+            lines.append(f"（也可发送 /job_action {token} <动作>）")
         return "\n".join(lines)

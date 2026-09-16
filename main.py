@@ -40,7 +40,7 @@ except Exception:  # pragma: no cover - 兼容旧版本
 
 
 PLUGIN_NAME = "astrbot_plugin_job_agent"
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.4.1"
 
 
 class _ProviderLlmClient:
@@ -193,6 +193,8 @@ class JobAgentPlugin(Star):
             access = f"不可访问（{self._short_error(FeishuAdapterError(self._adapter_reason))}）"
         provider = "已配置" if await self._ensure_agent() is not None else "未找到（Agent 不可用）"
         webhook = "运行中" if self.event_server else "未启用（缺少 webhook_token）"
+        await self.state.prune_cards()
+        await self.state.prune_deletes()
         pending = await self.state.pending_card_count()
         yield event.plain_result(
             "\n".join(
@@ -344,6 +346,7 @@ class JobAgentPlugin(Star):
             result.summary = "Agent 已处理，但尚未绑定通知会话"
             return result
 
+        await self.state.prune_cards()
         token = secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:10]
         card = self._build_card(event, result)
         try:

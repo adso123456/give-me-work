@@ -60,7 +60,8 @@
   "card_mode": {
     "description": "QQ 通知卡片模式",
     "type": "string",
-    "options": ["auto", "napcat", "text"],
+    "options": ["auto", "image", "napcat", "text"],
+    "hint": "auto=优先图片卡片，失败自动回退纯文本；image=只用图片；napcat/text=只用纯文本",
     "default": "auto"
   },
   "delete_confirm_required": {

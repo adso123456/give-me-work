@@ -60,6 +60,17 @@ UNWRITABLE_UI_TYPES = {
     "Location",
     "Reference",
 }
+# 可以参与服务端 contains 过滤的文本类字段
+SEARCHABLE_TEXT_UI_TYPES = {
+    "Text",
+    "Phone",
+    "Url",
+    "Barcode",
+    "Email",
+}
+# 单选/多选字段只能用 is 精确匹配，而且取值必须是已存在的选项，
+# 否则飞书会直接返回 1254018 InvalidFilter（实测）。
+SEARCHABLE_SELECT_UI_TYPES = {"SingleSelect", "MultiSelect"}
 
 ERROR_HINTS = {
     91403: "权限不足：请在开放平台为应用添加「查看、评论、编辑和管理多维表格」(bitable:app) 权限并发布版本，"
@@ -378,14 +389,93 @@ class FeishuApiAdapter:
             page_token = data.get("page_token")
 
     async def search_records(self, query: str) -> list[dict[str, Any]]:
-        records = await self.list_records()
-        needle = query.strip().casefold()
+        """优先走飞书 records/search 服务端过滤，失败再回退本地匹配。
+
+        本地匹配需要把整张表拉下来，表一大就是全量拉取；服务端搜索只回传命中的记录。
+        """
+        needle = (query or "").strip()
         if not needle:
-            return records
+            return await self.list_records()
+        try:
+            return await self._search_via_api(needle)
+        except FeishuAdapterError as exc:
+            logger.warning("[feishu] 服务端搜索失败(%s)，回退到本地匹配", exc)
+            return await self._search_local(needle)
+
+    async def _search_conditions(self, needle: str, text_only: bool = False) -> list[dict[str, Any]]:
+        fields = await self.list_fields()
+        conditions: list[dict[str, Any]] = []
+        for field in fields:
+            name = str(field.get("field_name") or "")
+            if not name:
+                continue
+            ui_type = self._ui_type(field)
+            if ui_type in SEARCHABLE_TEXT_UI_TYPES:
+                conditions.append(
+                    {"field_name": name, "operator": "contains", "value": [needle]}
+                )
+            elif (
+                not text_only
+                and ui_type in SEARCHABLE_SELECT_UI_TYPES
+                and needle in self._select_option_names(field)
+            ):
+                # 只在该选项确实存在时才用 is，否则飞书会拒绝整个 filter
+                conditions.append(
+                    {"field_name": name, "operator": "is", "value": [needle]}
+                )
+        return conditions
+
+    @staticmethod
+    def _select_option_names(field: dict[str, Any]) -> set[str]:
+        options = (field.get("property") or {}).get("options") or []
+        return {
+            str(option["name"])
+            for option in options
+            if isinstance(option, dict) and option.get("name") is not None
+        }
+
+    async def _search_via_api(self, needle: str) -> list[dict[str, Any]]:
+        conditions = await self._search_conditions(needle)
+        if not conditions:
+            return await self._search_local(needle)
+        try:
+            return await self._run_search(conditions)
+        except FeishuAdapterError as exc:
+            # 例如某个字段类型不接受该操作符：退化成只用文本字段再试一次
+            text_conditions = await self._search_conditions(needle, text_only=True)
+            if not text_conditions or text_conditions == conditions:
+                raise
+            logger.warning("[feishu] 过滤条件被拒绝(%s)，退化为仅文本字段重试", exc)
+            return await self._run_search(text_conditions)
+
+    async def _run_search(self, conditions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            body: dict[str, Any] = {
+                "filter": {"conjunction": "or", "conditions": conditions},
+                "page_size": 500,
+            }
+            params = {"page_token": page_token} if page_token else None
+            payload = await self._request(
+                "POST",
+                f"{self.table_path}/records/search",
+                json_body=body,
+                params=params,
+            )
+            data = payload.get("data") or {}
+            records.extend(self._record_to_dict(item) for item in (data.get("items") or []))
+            page_token = data.get("page_token")
+            if not data.get("has_more") or not page_token:
+                return records
+
+    async def _search_local(self, needle: str) -> list[dict[str, Any]]:
+        lowered = needle.casefold()
+        records = await self.list_records()
         return [
             record
             for record in records
-            if needle in json.dumps(record.get("fields") or {}, ensure_ascii=False).casefold()
+            if lowered in json.dumps(record.get("fields") or {}, ensure_ascii=False).casefold()
         ]
 
     async def get_record(self, record_id: str) -> dict[str, Any] | None:

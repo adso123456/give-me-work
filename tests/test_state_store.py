@@ -134,6 +134,51 @@ def test_latest_pending_card_prefers_newest_for_umo(tmp_path):
     asyncio.run(scenario())
 
 
+def test_prune_cards_drops_stale_pending_cards(tmp_path):
+    """没人理的待处理卡片也要能过期，否则只增不减。"""
+    import time
+
+    from state_store import StateStore
+
+    async def scenario():
+        store = StateStore(tmp_path / "state.json")
+        await store.load()
+        await store.add_pending_card(
+            {"card_id": "c_old", "token": "t_old", "created_at": time.time() - 7200}
+        )
+        await store.add_pending_card({"card_id": "c_new", "token": "t_new"})
+
+        removed = await store.prune_cards(ttl_seconds=3600)
+        assert removed == 1
+        assert await store.get_pending_card_by_token("t_old") is None
+        assert await store.get_pending_card_by_token("t_new") is not None
+
+    asyncio.run(scenario())
+
+
+def test_prune_cards_enforces_max_cards_and_cleans_tokens(tmp_path):
+    import time
+
+    from state_store import StateStore
+
+    async def scenario():
+        store = StateStore(tmp_path / "state.json")
+        await store.load()
+        base = time.time() - 10
+        for index in range(4):
+            await store.add_pending_card(
+                {"card_id": f"c{index}", "token": f"t{index}", "created_at": base + index}
+            )
+
+        removed = await store.prune_cards(ttl_seconds=10**6, max_cards=2)
+        assert removed == 2
+        snapshot = await store.snapshot()
+        assert [card["token"] for card in snapshot["pending_cards"]] == ["t2", "t3"]
+        assert set(snapshot["card_action_tokens"]) == {"t2", "t3"}
+
+    asyncio.run(scenario())
+
+
 def test_pending_delete_lifecycle(tmp_path):
     from state_store import StateStore
 
